@@ -1,3 +1,11 @@
+immutable-ubuntu (0.1.1~test1) UNRELEASED; urgency=medium
+
+  * Add @swap persistent subvolume for swapfile
+  * Unmount /target/cdrom before Phase 7 cleanup
+  * Remove gnome-initial-setup and related first-boot removals from Phase 8
+
+ -- Joshua <joshua@example.com>  Sun, 30 Mar 2026 12:00:00 -0400
+
 immutable-ubuntu (0.1.0) noble; urgency=medium
 
   * Initial release

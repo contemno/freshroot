@@ -184,6 +184,7 @@ info "Phase 7: Cleaning top-level btrfs"
 
 umount /target/boot/efi 2>/dev/null || true
 umount /target/boot     2>/dev/null || true
+umount /target/cdrom     2>/dev/null || true
 
 for item in /target/*; do
     base=$(basename "$item")
@@ -207,25 +208,11 @@ done
 # ══════════════════════════════════════════════════════════════════════
 info "Phase 8: Applying first-boot tweaks"
 
-curtin in-target --target="$T" -- apt-get remove -y \
-    gnome-initial-setup gnome-tour ubuntu-advantage-desktop-daemon 2>/dev/null || true
+# Remove unnecessary messages
 curtin in-target --target="$T" -- pro config set apt_news=false 2>/dev/null || true
-curtin in-target --target="$T" -- systemctl mask systemd-networkd-wait-online.service
-rm -f "$T/etc/cloud/cloud.cfg.d/90-installer-network.cfg"
 
 # Generate SSH host keys
 curtin in-target --target="$T" -- ssh-keygen -A
-
-# Mark gnome-initial-setup as done for admin user
-ADMIN_HOME="/target/@home/admin"
-mkdir -p "$ADMIN_HOME/.config"
-touch "$ADMIN_HOME/.config/gnome-initial-setup-done"
-
-# Fix ownership
-ADMIN_IDS=$(grep '^admin:' "$T/etc/passwd" | cut -d: -f3,4)
-ADMIN_UID="${ADMIN_IDS%:*}"
-ADMIN_GID="${ADMIN_IDS#*:}"
-chown -R "${ADMIN_UID}:${ADMIN_GID}" "$ADMIN_HOME/.config"
 
 # Seed cloud-init state so it doesn't re-run on every boot
 mkdir -p "$T/var/lib/cloud/instance"
@@ -265,25 +252,24 @@ done
 info "Phase 10: Configuring dracut and GRUB"
 
 # Set up cleanup trap for Phase 10 mounts
-trap 'umount "$T/.snapshots" 2>/dev/null || true; umount "$T/boot/efi" 2>/dev/null || true; umount "$T/boot" 2>/dev/null || true; umount /target/@ 2>/dev/null || true' EXIT
+trap 'umount "$T/boot/efi" 2>/dev/null || true; umount "$T/boot" 2>/dev/null || true; umount /target/@ 2>/dev/null || true' EXIT
 
 mount -t btrfs -o subvol=@,noatime "$BTRFS_DEV" /target/@
 mount -L BOOT "$T/boot"
 mount -L EFI  "$T/boot/efi"
-mount -t btrfs -o subvol=@snapshots,noatime "$BTRFS_DEV" "$T/.snapshots"
 
 curtin in-target --target="$T" -- dracut --regenerate-all --force
-chmod -x "$T/etc/grub.d/10_linux"
+curtin in-target --target="$T" -- chmod -x "/etc/grub.d/10_linux"
 curtin in-target --target="$T" -- update-grub
 curtin in-target --target="$T" -- grub-install \
     --target=x86_64-efi --efi-directory=/boot/efi \
     --bootloader-id=ubuntu --recheck
 
 # Unmount Phase 10 mounts before Phase 11
-umount "$T/.snapshots" 2>/dev/null || true
 umount "$T/boot/efi"   2>/dev/null || true
 umount "$T/boot"       2>/dev/null || true
 umount /target/@       2>/dev/null || true
+umount /target         2>/dev/null || true
 
 # Clear the trap (mounts already cleaned up)
 trap - EXIT
@@ -292,6 +278,7 @@ trap - EXIT
 # Phase 11: Mount @log for installer shutdown
 # ══════════════════════════════════════════════════════════════════════
 info "Phase 11: Mounting @log for installer shutdown"
+mount -t btrfs -o subvol=@,noatime "$BTRFS_DEV" /target
 mkdir -p /target/var/log
 mount -t btrfs -o subvol=@log,noatime "$BTRFS_DEV" /target/var/log
 mkdir -p /target/var/log/installer
