@@ -4,7 +4,7 @@
 *.changes
 *.tar.*
 debian/.debhelper/
-debian/immutable-ubuntu/
+debian/freshroot/
 debian/files
 debian/debhelper-build-stamp
 debian/*.substvars

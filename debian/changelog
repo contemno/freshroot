@@ -1,4 +1,68 @@
-immutable-ubuntu (0.1.1~test1) UNRELEASED; urgency=medium
+freshroot (0.1.1~test9) UNRELEASED; urgency=medium
+
+  * 06_freshroot: per-snapshot submenus listing all compatible kernels,
+    not just the newest. Snapshots with no matching kernel are skipped.
+  * freshroot-update: hold kernel packages referenced by any existing
+    snapshot before running apt, preventing autoremove from breaking
+    older snapshots
+  * BIND_MOUNTS now applied to the default update path (in addition to
+    --shell and --provision)
+  * Support local:// REPO scheme: skip git clone and run install.sh
+    directly from a path inside the container (pair with BIND_MOUNTS
+    to test uncommitted playbooks/scripts)
+
+ -- Joshua <joshua@example.com>  Tue, 07 Apr 2026 15:00:00 -0400
+
+freshroot (0.1.1~test8) UNRELEASED; urgency=medium
+
+  * 06_freshroot: match each snapshot to the newest kernel that has
+    modules inside it; skip snapshots with no compatible kernel.
+    Prevents kernel panic when booting old snapshots after kernel upgrades.
+  * Snapshot history submenu now shows kernel version per entry
+  * BIND_MOUNTS now applied to the default update path (in addition to
+    --shell and --provision)
+  * Support local:// REPO scheme: skip git clone and run install.sh
+    directly from a path inside the container (pair with BIND_MOUNTS
+    to test uncommitted playbooks/scripts)
+
+ -- Joshua <joshua@example.com>  Tue, 07 Apr 2026 14:00:00 -0400
+
+freshroot (0.1.1~test7) UNRELEASED; urgency=medium
+
+  * BIND_MOUNTS now applied to the default update path (in addition to
+    --shell and --provision)
+  * Support local:// REPO scheme: skip git clone and run install.sh
+    directly from a path inside the container (pair with BIND_MOUNTS
+    to test uncommitted playbooks/scripts)
+
+ -- Joshua <joshua@example.com>  Tue, 07 Apr 2026 13:00:00 -0400
+
+freshroot (0.1.1~test6) UNRELEASED; urgency=medium
+
+  * Add BIND_MOUNTS config option for exposing host paths into the
+    staging nspawn container (interactive shell and provisioning paths)
+  * Add EDITION config + freshroot-setup --edition flag; GRUB entries
+    now show "Freshroot Workstation" / "Freshroot Server" when set
+
+ -- Joshua <joshua@example.com>  Tue, 07 Apr 2026 12:00:00 -0400
+
+freshroot (0.1.1~test5) UNRELEASED; urgency=medium
+
+  * Rename project from immutable-ubuntu to freshroot (distro-agnostic name)
+  * Ship freshroot-setup as a separate artifact (no longer in deb)
+
+ -- Joshua <joshua@example.com>  Sun, 05 Apr 2026 13:00:00 -0400
+
+freshroot (0.1.1~test4) UNRELEASED; urgency=medium
+
+  * Run cloud-init in staging subvolume via freshroot-update --provision
+  * Mask cloud-init services on running system (Phase 8)
+  * Add freshroot-provision.service for first-boot provisioning
+  * Provision step self-removes its service file from staging snapshot
+
+ -- Joshua <joshua@example.com>  Sun, 05 Apr 2026 12:00:00 -0400
+
+freshroot (0.1.1~test3) UNRELEASED; urgency=medium
 
   * Add @swap persistent subvolume for swapfile
   * Unmount /target/cdrom before Phase 7 cleanup
@@ -6,12 +70,12 @@ immutable-ubuntu (0.1.1~test1) UNRELEASED; urgency=medium
 
  -- Joshua <joshua@example.com>  Sun, 30 Mar 2026 12:00:00 -0400
 
-immutable-ubuntu (0.1.0) noble; urgency=medium
+freshroot (0.1.0) noble; urgency=medium
 
   * Initial release
   * dracut module for boot-time writable snapshot creation
   * GRUB hook for snapshot-based boot entries
-  * immutable-update staging script with nspawn
-  * immutable-ubuntu-setup bootstrap for autoinstall
+  * freshroot-update staging script with nspawn
+  * freshroot-setup bootstrap for autoinstall
 
  -- Joshua <joshua@example.com>  Sat, 22 Mar 2026 12:00:00 -0400

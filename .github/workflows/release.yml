@@ -16,12 +16,12 @@ jobs:
       - name: Shellcheck scripts
         run: |
           shellcheck -s bash \
-            data/usr/sbin/immutable-update \
-            data/usr/sbin/immutable-ubuntu-setup \
-            data/usr/lib/dracut/modules.d/90immutable-ubuntu/module-setup.sh \
-            data/usr/lib/dracut/modules.d/90immutable-ubuntu/immutable-ubuntu-setup.sh \
-            data/usr/lib/dracut/modules.d/90immutable-ubuntu/immutable-ubuntu-generator \
-            data/etc/grub.d/06_immutable
+            data/usr/sbin/freshroot-update \
+            installer/freshroot-setup \
+            data/usr/lib/dracut/modules.d/90freshroot/module-setup.sh \
+            data/usr/lib/dracut/modules.d/90freshroot/freshroot-setup.sh \
+            data/usr/lib/dracut/modules.d/90freshroot/freshroot-generator \
+            data/etc/grub.d/06_freshroot
 
   build:
     needs: lint
@@ -70,11 +70,12 @@ jobs:
         run: |
           mkdir -p artifacts
           cp ../*.deb ../*.buildinfo ../*.changes artifacts/
+          install -m 0755 installer/freshroot-setup artifacts/
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: immutable-ubuntu
+          name: freshroot
           path: artifacts/
 
   release:
@@ -93,6 +94,8 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/*.deb
+          files: |
+            artifacts/*.deb
+            artifacts/freshroot-setup
           generate_release_notes: true
           prerelease: ${{ needs.build.outputs.prerelease == 'true' }}

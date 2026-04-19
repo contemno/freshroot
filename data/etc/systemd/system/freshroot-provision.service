@@ -1,0 +1,11 @@
+[Unit]
+Description=First-boot cloud-init provisioning via freshroot-update
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/freshroot-update --provision
+
+[Install]
+WantedBy=multi-user.target

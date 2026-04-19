@@ -1,12 +1,12 @@
 [Unit]
 Description=Immutable root update (stage snapshot via nspawn)
-Documentation=file:///etc/immutable-update.conf
+Documentation=file:///etc/freshroot-update.conf
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/sbin/immutable-update
+ExecStart=/usr/sbin/freshroot-update
 TimeoutStartSec=3600
 # Keep the nspawn container's child processes confined
 KillMode=mixed

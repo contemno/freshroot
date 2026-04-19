@@ -1,6 +1,6 @@
 [Unit]
 Description=Immutable root update timer (every 4 hours)
-Documentation=file:///etc/immutable-update.conf
+Documentation=file:///etc/freshroot-update.conf
 
 [Timer]
 OnBootSec=15min

@@ -1,22 +1,24 @@
-Source: immutable-ubuntu
+Source: freshroot
 Section: admin
 Priority: optional
 Maintainer: Joshua <joshua@example.com>
 Build-Depends: debhelper-compat (= 13)
 Standards-Version: 4.6.2
 
-Package: immutable-ubuntu
+Package: freshroot
 Architecture: all
 Depends: btrfs-progs, dracut, systemd-container, ${misc:Depends}
 Recommends: git, btrbk
 Conflicts: initramfs-tools
-Description: Immutable Ubuntu root via btrfs snapshots
- Makes an Ubuntu installation effectively immutable by booting from
+Description: Freshroot — btrfs snapshot-based immutable root
+ Makes a Linux installation effectively immutable by booting from
  read-only btrfs snapshots. A dracut initramfs module creates a writable
  clone at boot, and a staging pipeline handles updates via systemd-nspawn.
  .
  Includes:
   - dracut module for boot-time snapshot cloning
   - GRUB hook for snapshot-based boot entries
-  - immutable-update script for staged apt updates and custom scripts
-  - immutable-ubuntu-setup for autoinstall bootstrapping
+  - freshroot-update script for staged apt updates and custom scripts
+ .
+ The autoinstall bootstrap script (freshroot-setup) ships
+ separately and is run from the installation media.

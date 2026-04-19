@@ -1,5 +1,5 @@
 #!/bin/bash
-# /usr/lib/dracut/modules.d/90immutable-ubuntu/immutable-ubuntu-generator
+# /usr/lib/dracut/modules.d/90freshroot/freshroot-generator
 #
 # systemd generator — runs early in initramfs before any .mount units.
 #
@@ -12,9 +12,9 @@
 # generator-created units.
 #
 # What this generator does:
-#   1. Checks /proc/cmdline for rd.immutable — exits if absent.
+#   1. Checks /proc/cmdline for rd.freshroot — exits if absent.
 #   2. Parses root= and rootflags= from /proc/cmdline.
-#   3. Creates immutable-ubuntu-setup.service that runs the btrfs
+#   3. Creates freshroot-setup.service that runs the btrfs
 #      snapshot logic BEFORE sysroot.mount.
 #   4. Creates a sysroot.mount.d drop-in that changes Options=
 #      to mount @rootfs instead of the read-only snapshot.
@@ -25,9 +25,9 @@ NORMAL_DIR="$1"
 # ── Parse /proc/cmdline ───────────────────────────────────────────────
 cmdline=$(< /proc/cmdline)
 
-# Gate: only act when rd.immutable is present
+# Gate: only act when rd.freshroot is present
 case " $cmdline " in
-    *" rd.immutable "*|*" rd.immutable="*) ;;
+    *" rd.freshroot "*|*" rd.freshroot="*) ;;
     *) exit 0 ;;
 esac
 
@@ -74,9 +74,9 @@ else
     rootfs_opts="subvol=@rootfs"
 fi
 
-# ── Create immutable-ubuntu-setup.service ───────────────────────────────
+# ── Create freshroot-setup.service ───────────────────────────────
 # This service runs the btrfs snapshot work before sysroot.mount starts.
-cat > "${NORMAL_DIR}/immutable-ubuntu-setup.service" << EOF
+cat > "${NORMAL_DIR}/freshroot-setup.service" << EOF
 [Unit]
 Description=Immutable root: create writable @rootfs from snapshot
 DefaultDependencies=no
@@ -88,15 +88,15 @@ RequiresMountsFor=/run
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/bin/immutable-ubuntu-setup.sh ${root_arg} ${target}
+ExecStart=/bin/freshroot-setup.sh ${root_arg} ${target}
 EOF
 
 # Make sysroot.mount depend on our service
 mkdir -p "${NORMAL_DIR}/sysroot.mount.d"
-cat > "${NORMAL_DIR}/sysroot.mount.d/immutable-ubuntu.conf" << EOF
+cat > "${NORMAL_DIR}/sysroot.mount.d/freshroot.conf" << EOF
 [Unit]
-After=immutable-ubuntu-setup.service
-Requires=immutable-ubuntu-setup.service
+After=freshroot-setup.service
+Requires=freshroot-setup.service
 
 [Mount]
 Options=${rootfs_opts}
@@ -104,7 +104,7 @@ EOF
 
 # Make sure the service is wanted
 mkdir -p "${NORMAL_DIR}/initrd.target.wants"
-ln -sf ../immutable-ubuntu-setup.service \
-    "${NORMAL_DIR}/initrd.target.wants/immutable-ubuntu-setup.service"
+ln -sf ../freshroot-setup.service \
+    "${NORMAL_DIR}/initrd.target.wants/freshroot-setup.service"
 
 exit 0

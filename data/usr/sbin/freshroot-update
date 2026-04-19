@@ -1,29 +1,31 @@
 #!/bin/bash 
-# /usr/sbin/immutable-update
+# /usr/sbin/freshroot-update
 # Immutable root change script: stage updates in a btrfs snapshot via nspawn.
 set -euo pipefail
 
 INTERACTIVE=0
 GUI=0
+PROVISION_ONLY=0
 for _arg in "$@"; do
     case "$_arg" in
-        --shell|-i) INTERACTIVE=1 ;;
-        --gui)      INTERACTIVE=1; GUI=1 ;;
+        --shell|-i)  INTERACTIVE=1 ;;
+        --gui)       INTERACTIVE=1; GUI=1 ;;
+        --provision) PROVISION_ONLY=1 ;;
     esac
 done
 
-CONF="/etc/immutable-update.conf"
+CONF="/etc/freshroot-update.conf"
 if [[ ! -f "$CONF" ]]; then
     echo "ERROR: config not found at $CONF" >&2
     exit 1
 fi
-# shellcheck source=/etc/immutable-update.conf
+# shellcheck source=/etc/freshroot-update.conf
 source "$CONF"
 
 # ── Globals ──────────────────────────────────────────────────────────
-TOPLEVEL="/run/immutable-update/btrfs-toplevel"
+TOPLEVEL="/run/freshroot-update/btrfs-toplevel"
 STAMP="root.$(date +%Y%m%dT%H%M%S)"
-LOCKFILE="/run/immutable-update.lock"
+LOCKFILE="/run/freshroot-update.lock"
 LOG_FILE="${LOG_DIR}/update-${STAMP}.log"
 
 # ── Helpers ──────────────────────────────────────────────────────────
@@ -52,12 +54,12 @@ trap cleanup EXIT
 # Acquire an exclusive lock so timer and manual runs don't collide
 exec 9>"$LOCKFILE"
 if ! flock -n 9; then
-    echo "Another immutable-update is already running. Exiting." >&2
+    echo "Another freshroot-update is already running. Exiting." >&2
     exit 0
 fi
 
 mkdir -p "$LOG_DIR"
-info "=== immutable-update started ==="
+info "=== freshroot-update started ==="
 
 # ── Resolve the btrfs device backing root ────────────────────────────
 resolve_btrfs_device() {
@@ -127,6 +129,83 @@ if [[ -n "$EFI_PARTITION" && "$EFI_PARTITION" != "$BOOT_PARTITION" ]]; then
         || die "failed to bind-mount $EFI_PARTITION"
 fi
 
+# ── Build extra bind-mount flags from BIND_MOUNTS ────────────────────
+# Each entry is "HOST:CONTAINER[:ro]". Read-only entries become
+# --bind-ro=HOST:CONTAINER, others become --bind=HOST:CONTAINER.
+EXTRA_BINDS=()
+for _bm in "${BIND_MOUNTS[@]:-}"; do
+    [[ -z "$_bm" ]] && continue
+    _host="${_bm%%:*}"
+    _rest="${_bm#*:}"
+    if [[ "$_rest" == *:ro ]]; then
+        _container="${_rest%:ro}"
+        [[ -e "$_host" ]] || { warn "BIND_MOUNTS: host path missing, skipping: $_host"; continue; }
+        EXTRA_BINDS+=("--bind-ro=${_host}:${_container}")
+        info "bind-mount (ro): $_host -> $_container"
+    else
+        _container="$_rest"
+        [[ -e "$_host" ]] || { warn "BIND_MOUNTS: host path missing, skipping: $_host"; continue; }
+        EXTRA_BINDS+=("--bind=${_host}:${_container}")
+        info "bind-mount (rw): $_host -> $_container"
+    fi
+done
+
+# ── Protect kernels referenced by existing snapshots ─────────────────
+# Scan all snapshots' /usr/lib/modules/ to find kernel versions in use,
+# then apt-mark hold the corresponding packages inside the staging
+# subvolume so that apt full-upgrade / autoremove cannot remove them.
+protect_snapshot_kernels() {
+    local snap_dir="$1" staging="$2"
+    local -A in_use=()
+
+    # Collect kernel versions from all read-only snapshots
+    for snap in "${snap_dir}"/*/; do
+        [[ -d "${snap}usr/lib/modules" ]] || continue
+        for mod_dir in "${snap}usr/lib/modules"/*/; do
+            [[ -d "$mod_dir" ]] || continue
+            local kver
+            kver=$(basename "$mod_dir")
+            in_use["$kver"]=1
+        done
+    done
+
+    # Also protect kernels from the root subvolume (@)
+    if [[ -d "${TOPLEVEL}/${ROOT_SUBVOL}/usr/lib/modules" ]]; then
+        for mod_dir in "${TOPLEVEL}/${ROOT_SUBVOL}/usr/lib/modules"/*/; do
+            [[ -d "$mod_dir" ]] || continue
+            local kver
+            kver=$(basename "$mod_dir")
+            in_use["$kver"]=1
+        done
+    fi
+
+    if [[ ${#in_use[@]} -eq 0 ]]; then
+        info "no kernel versions found in snapshots — skipping hold"
+        return
+    fi
+
+    # Build the list of packages to hold inside the staging chroot
+    local hold_pkgs=()
+    for kver in "${!in_use[@]}"; do
+        for prefix in linux-image linux-modules linux-modules-extra; do
+            # Only hold if the package is actually installed in staging
+            if chroot "$staging" dpkg -s "${prefix}-${kver}" &>/dev/null; then
+                hold_pkgs+=("${prefix}-${kver}")
+            fi
+        done
+    done
+
+    if [[ ${#hold_pkgs[@]} -gt 0 ]]; then
+        info "holding ${#hold_pkgs[@]} kernel package(s) referenced by snapshots"
+        chroot "$staging" apt-mark hold "${hold_pkgs[@]}" >/dev/null 2>&1 || true
+        for pkg in "${hold_pkgs[@]}"; do
+            info "  held: $pkg"
+        done
+    fi
+}
+
+protect_snapshot_kernels "$SNAP_PATH" "$STAGING_PATH"
+
 # ── Run updates inside nspawn container ──────────────────────────────
 NSPAWN_RC=0
 
@@ -138,6 +217,7 @@ if [[ $INTERACTIVE -eq 1 ]]; then
         --resolv-conf=bind-stub
         --setenv=DEBIAN_FRONTEND=noninteractive
         --console=interactive
+        "${EXTRA_BINDS[@]}"
     )
 
     if [[ $GUI -eq 1 ]]; then
@@ -146,7 +226,7 @@ if [[ $INTERACTIVE -eq 1 ]]; then
         XDG_DIR="/run/user/${CALLER_UID}"
 
         NSPAWN_ARGS+=(
-            --bind=/dev/dri
+            --bind=/dev
             --bind=/tmp/.X11-unix
             --property=DeviceAllow=/dev/dri/card0
             --property=DeviceAllow=/dev/dri/renderD128
@@ -170,6 +250,31 @@ if [[ $INTERACTIVE -eq 1 ]]; then
 
     systemd-nspawn "${NSPAWN_ARGS[@]}" \
         /bin/bash --norc --noprofile -c 'set +u; exec bash -l' || NSPAWN_RC=$?
+
+elif [[ $PROVISION_ONLY -eq 1 ]]; then
+    info "entering nspawn container for cloud-init provisioning"
+    systemd-nspawn \
+        --directory="$STAGING_PATH" \
+        --resolv-conf=bind-stub \
+        --setenv=DEBIAN_FRONTEND=noninteractive \
+        "${EXTRA_BINDS[@]}" \
+        --quiet \
+        --console=pipe \
+        /bin/bash -e <<'INNER' 2>&1 | tee -a "$LOG_FILE" || NSPAWN_RC=${PIPESTATUS[0]}
+
+# ── Cloud-init provisioning ─────────────────────────────────────────
+echo "==> Running cloud-init provisioning"
+cloud-init init --local
+cloud-init init
+cloud-init modules --mode=config
+cloud-init modules --mode=final
+
+# Remove the first-boot service so it doesn't run again from the new snapshot
+rm -f /etc/systemd/system/freshroot-provision.service
+rm -f /etc/systemd/system/multi-user.target.wants/freshroot-provision.service
+
+INNER
+
 else
     # Serialize REPOS array for passing into nspawn
     REPOS_JOINED=""
@@ -182,7 +287,8 @@ else
         --directory="$STAGING_PATH" \
         --resolv-conf=bind-stub \
         --setenv=DEBIAN_FRONTEND=noninteractive \
-        --setenv=_IMMUTABLE_REPOS="$REPOS_JOINED" \
+        --setenv=_FRESHROOT_REPOS="$REPOS_JOINED" \
+        "${EXTRA_BINDS[@]}" \
         --quiet \
         --console=pipe \
         /bin/bash -e <<'INNER' 2>&1 | tee -a "$LOG_FILE" || NSPAWN_RC=${PIPESTATUS[0]}
@@ -192,20 +298,42 @@ apt-get update
 apt-get full-upgrade -y
 apt-get autoremove -y
 
+# ── Cloud-init provisioning ─────────────────────────────────────────
+echo "==> Running cloud-init provisioning"
+cloud-init init --local
+cloud-init init
+cloud-init modules --mode=config
+cloud-init modules --mode=final
+
 # ── Run post-update scripts ─────────────────────────────────────────
 while IFS= read -r repo; do
     [[ -z "$repo" ]] && continue
-    echo "==> Cloning $repo"
-    work=$(mktemp -d /tmp/immutable-repo.XXXXXX)
-    git clone --depth=1 "$repo" "$work"
-    if [[ -x "$work/install.sh" ]]; then
-        echo "==> Running install.sh from $repo"
-        (cd "$work" && ./install.sh)
+    if [[ "$repo" == local://* ]]; then
+        # Local path (typically a bind-mounted dir): run install.sh in place
+        path="${repo#local://}"
+        if [[ ! -d "$path" ]]; then
+            echo "WARNING: local path not found: $path — skipping" >&2
+            continue
+        fi
+        if [[ -x "$path/install.sh" ]]; then
+            echo "==> Running install.sh from $path (local)"
+            (cd "$path" && ./install.sh)
+        else
+            echo "WARNING: no executable install.sh in $path — skipping" >&2
+        fi
     else
-        echo "WARNING: no executable install.sh in $repo — skipping" >&2
+        echo "==> Cloning $repo"
+        work=$(mktemp -d /tmp/freshroot-repo.XXXXXX)
+        git clone --depth=1 "$repo" "$work"
+        if [[ -x "$work/install.sh" ]]; then
+            echo "==> Running install.sh from $repo"
+            (cd "$work" && ./install.sh)
+        else
+            echo "WARNING: no executable install.sh in $repo — skipping" >&2
+        fi
+        rm -rf "$work"
     fi
-    rm -rf "$work"
-done <<< "${_IMMUTABLE_REPOS:-}"
+done <<< "${_FRESHROOT_REPOS:-}"
 
 INNER
 fi
@@ -258,7 +386,7 @@ if [[ "${MAX_SNAPSHOTS:-0}" -gt 0 ]]; then
 fi
 
 # ── Update GRUB to pick up the new snapshot ──────────────────────────
-# Mount @snapshots so 06_immutable can discover them
+# Mount @snapshots so 06_freshroot can discover them
 SNAP_MOUNT="/.snapshots"
 BTRFS_DEV_FOR_MOUNT=$(findmnt -n -o SOURCE / | head -1)
 BTRFS_DEV_FOR_MOUNT="${BTRFS_DEV_FOR_MOUNT%%\[*}"
@@ -267,5 +395,5 @@ info "regenerating GRUB configuration"
 update-grub 2>&1 | tee -a "$LOG_FILE" || warn "update-grub failed"
 umount "$SNAP_MOUNT" 2>/dev/null || true
 
-info "=== immutable-update completed successfully ==="
+info "=== freshroot-update completed successfully ==="
 info "New snapshot ${STAMP} is ready. Reboot to apply."

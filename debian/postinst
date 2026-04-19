@@ -4,7 +4,8 @@ set -e
 case "$1" in
     configure)
         systemctl daemon-reload 2>/dev/null || true
-        systemctl enable immutable-update.timer 2>/dev/null || true
+        systemctl enable freshroot-update.timer 2>/dev/null || true
+        systemctl enable freshroot-provision.service 2>/dev/null || true
         systemctl enable machine-id-persist.service 2>/dev/null || true
 
         # On upgrades (not first install), regenerate initramfs and GRUB

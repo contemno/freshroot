@@ -1,17 +1,19 @@
-PACKAGE  := immutable-ubuntu
-VERSION  := $(shell dpkg-parsechangelog -S Version)
+PACKAGE  := freshroot
+SRCDIR   := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
+VERSION  := $(shell dpkg-parsechangelog -l $(SRCDIR)/debian/changelog -S Version)
 DEB      := target/$(PACKAGE)_$(VERSION)_all.deb
+SETUP    := target/freshroot-setup
 
-SCRIPTS  := data/usr/sbin/immutable-update \
-            data/usr/sbin/immutable-ubuntu-setup \
-            data/usr/lib/dracut/modules.d/90immutable-ubuntu/module-setup.sh \
-            data/usr/lib/dracut/modules.d/90immutable-ubuntu/immutable-ubuntu-setup.sh \
-            data/usr/lib/dracut/modules.d/90immutable-ubuntu/immutable-ubuntu-generator \
-            data/etc/grub.d/06_immutable
+SCRIPTS  := data/usr/sbin/freshroot-update \
+            installer/freshroot-setup \
+            data/usr/lib/dracut/modules.d/90freshroot/module-setup.sh \
+            data/usr/lib/dracut/modules.d/90freshroot/freshroot-setup.sh \
+            data/usr/lib/dracut/modules.d/90freshroot/freshroot-generator \
+            data/etc/grub.d/06_freshroot
 
 .PHONY: build clean lint
 
-build: $(DEB)
+build: $(DEB) $(SETUP)
 
 $(DEB):
 	dpkg-buildpackage -us -uc -b
@@ -19,6 +21,10 @@ $(DEB):
 	mv ../$(PACKAGE)_$(VERSION)_all.deb target/
 	mv ../$(PACKAGE)_$(VERSION)_*.buildinfo target/ 2>/dev/null || true
 	mv ../$(PACKAGE)_$(VERSION)_*.changes target/ 2>/dev/null || true
+
+$(SETUP): installer/freshroot-setup
+	mkdir -p target
+	install -m 0755 installer/freshroot-setup $(SETUP)
 
 lint:
 	shellcheck -s bash $(SCRIPTS)

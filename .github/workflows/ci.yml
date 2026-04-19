@@ -18,12 +18,12 @@ jobs:
       - name: Shellcheck scripts
         run: |
           shellcheck -s bash \
-            data/usr/sbin/immutable-update \
-            data/usr/sbin/immutable-ubuntu-setup \
-            data/usr/lib/dracut/modules.d/90immutable-ubuntu/module-setup.sh \
-            data/usr/lib/dracut/modules.d/90immutable-ubuntu/immutable-ubuntu-setup.sh \
-            data/usr/lib/dracut/modules.d/90immutable-ubuntu/immutable-ubuntu-generator \
-            data/etc/grub.d/06_immutable
+            data/usr/sbin/freshroot-update \
+            installer/freshroot-setup \
+            data/usr/lib/dracut/modules.d/90freshroot/module-setup.sh \
+            data/usr/lib/dracut/modules.d/90freshroot/freshroot-setup.sh \
+            data/usr/lib/dracut/modules.d/90freshroot/freshroot-generator \
+            data/etc/grub.d/06_freshroot
 
   build:
     runs-on: ubuntu-latest
@@ -43,5 +43,5 @@ jobs:
 
       - name: Verify package contents
         run: |
-          dpkg-deb -c ../immutable-ubuntu_*.deb
-          dpkg-deb -I ../immutable-ubuntu_*.deb
+          dpkg-deb -c ../freshroot_*.deb
+          dpkg-deb -I ../freshroot_*.deb

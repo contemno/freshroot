@@ -1,0 +1,213 @@
+#!/bin/sh
+# /etc/grub.d/06_freshroot
+#
+# Generates GRUB menu entries for the freshroot boot model:
+#
+#   1. "Freshroot (clean)" — DEFAULT
+#      Boots from the latest btrfs snapshot with the newest compatible
+#      kernel. The initramfs creates a writable clone (@rootfs) from
+#      the snapshot, discarding drift since the last update.
+#
+#   2. "Freshroot (tainted)"
+#      Boots from @ directly, with the staging service masked.
+#
+#   3. Per-snapshot submenus
+#      One submenu per snapshot, each containing one entry per kernel
+#      that has modules installed in that snapshot.
+#
+# Each entry is paired only with kernels whose modules exist inside
+# the target root, preventing kernel panics from missing modules.
+
+set -e
+
+# --- Configuration ---
+EDITION=""
+# shellcheck source=/etc/freshroot-update.conf
+[ -r /etc/freshroot-update.conf ] && . /etc/freshroot-update.conf
+
+# Build the label: "Freshroot" or "Freshroot Workstation" etc.
+if [ -n "$EDITION" ]; then
+    _ed_first=$(printf '%s' "$EDITION" | cut -c1 | tr '[:lower:]' '[:upper:]')
+    _ed_rest=$(printf '%s' "$EDITION" | cut -c2-)
+    LABEL="Freshroot ${_ed_first}${_ed_rest}"
+else
+    LABEL="Freshroot"
+fi
+
+SNAPSHOT_DIR="/.snapshots"
+BTRFS_DEVICE=$(findmnt -n -o SOURCE / | sed 's/\[.*\]//')
+BTRFS_UUID=$(findmnt -n -o UUID /)
+BOOT_UUID=$(findmnt -n -o UUID /boot)
+
+# Find the LUKS UUID if applicable (for rd.luks.uuid= / rd.luks.name=)
+CRYPT_UUID=""
+DM_NAME=$(dmsetup info -c --noheadings -o name "$BTRFS_DEVICE" 2>/dev/null || true)
+if [ -n "$DM_NAME" ]; then
+    CRYPT_BACKING=$(cryptsetup status "$DM_NAME" 2>/dev/null | grep "device:" | awk '{print $2}')
+    if [ -n "$CRYPT_BACKING" ]; then
+        CRYPT_UUID=$(blkid -s UUID -o value "$CRYPT_BACKING" 2>/dev/null || true)
+    fi
+fi
+
+# Build the base kernel command line.
+BASE_CMDLINE="${GRUB_CMDLINE_LINUX:-}"
+
+# Add dracut LUKS parameters if encrypted
+if [ -n "$CRYPT_UUID" ]; then
+    echo "$BASE_CMDLINE" | grep -q "rd.luks.uuid=" || \
+        BASE_CMDLINE="rd.luks.uuid=${CRYPT_UUID} rd.luks.name=${CRYPT_UUID}=${DM_NAME} ${BASE_CMDLINE}"
+fi
+
+# --- Collect all kernels available in /boot, newest first ---
+ALL_BOOT_KERNELS=$(ls /boot/vmlinuz-* 2>/dev/null | sed 's|.*/vmlinuz-||' | sort -rV)
+
+if [ -z "$ALL_BOOT_KERNELS" ]; then
+    echo "Warning: No kernels found in /boot" >&2
+    exit 0
+fi
+
+# --- Find kernels compatible with a given root path ---
+# Returns matching kernel versions (newest first) on stdout.
+# A kernel is compatible if its modules dir exists inside the root
+# AND a matching initrd exists in /boot.
+kernels_for() {
+    _root="$1"
+    for _krel in $ALL_BOOT_KERNELS; do
+        if [ -d "${_root}/usr/lib/modules/${_krel}" ] && \
+           [ -f "/boot/initrd.img-${_krel}" ]; then
+            echo "$_krel"
+        fi
+    done
+}
+
+# --- Find the newest compatible kernel for a root path ---
+# Sets BK_REL, BK_VMLINUZ, BK_INITRD. Returns 1 if none.
+best_kernel_for() {
+    _krel=$(kernels_for "$1" | head -1)
+    if [ -z "$_krel" ]; then
+        return 1
+    fi
+    BK_REL="$_krel"
+    BK_VMLINUZ="/vmlinuz-${_krel}"
+    BK_INITRD="/initrd.img-${_krel}"
+    return 0
+}
+
+# --- Emit a single GRUB menu entry ---
+# Reads kernel info from BK_REL, BK_VMLINUZ, BK_INITRD.
+emit_entry() {
+    _title="$1"
+    _subvol="$2"
+    _freshroot="$3"     # "yes" to add rd.freshroot
+    _extra="$4"         # additional kernel params
+
+    _rootflags="subvol=${_subvol}"
+    _cmdline="root=UUID=${BTRFS_UUID} ro rootflags=${_rootflags} ${BASE_CMDLINE}"
+
+    if [ "$_freshroot" = "yes" ]; then
+        _cmdline="${_cmdline} rd.freshroot"
+    fi
+    if [ -n "$_extra" ]; then
+        _cmdline="${_cmdline} ${_extra}"
+    fi
+
+    cat << ENTRY
+menuentry '${_title}' --class ubuntu --class gnu-linux --class os {
+    insmod gzio
+    insmod part_gpt
+    insmod btrfs
+
+    search --no-floppy --fs-uuid --set=root ${BOOT_UUID}
+
+    echo 'Loading kernel ${BK_REL} ...'
+    linux ${BK_VMLINUZ} ${_cmdline}
+    echo 'Loading initrd ...'
+    initrd ${BK_INITRD}
+}
+ENTRY
+}
+
+# --- Find snapshots ---
+SNAPSHOTS=""
+if [ -d "$SNAPSHOT_DIR" ]; then
+    SNAPSHOTS=$(find "$SNAPSHOT_DIR" -maxdepth 1 -name "root.*" -printf '%f\n' 2>/dev/null | sort -r)
+fi
+
+LATEST_SNAP=$(echo "$SNAPSHOTS" | head -1)
+
+# ==========================================================================
+# Entry 1: DEFAULT — Boot from latest snapshot (clean), newest kernel
+# ==========================================================================
+if [ -n "$LATEST_SNAP" ]; then
+    if best_kernel_for "${SNAPSHOT_DIR}/${LATEST_SNAP}"; then
+        emit_entry \
+            "${LABEL} (clean — ${LATEST_SNAP})" \
+            "@snapshots/${LATEST_SNAP}" \
+            "yes" \
+            ""
+    else
+        echo "# WARNING: latest snapshot ${LATEST_SNAP} has no matching kernel in /boot" >&2
+    fi
+else
+    if best_kernel_for "/"; then
+        emit_entry \
+            "${LABEL} (clean — no snapshots, using @)" \
+            "@" \
+            "yes" \
+            ""
+    fi
+fi
+
+# ==========================================================================
+# Entry 2: Tainted — Boot from @ with staging service masked
+# ==========================================================================
+if best_kernel_for "/"; then
+    emit_entry \
+        "${LABEL} (tainted — current root, skip rollback)" \
+        "@" \
+        "" \
+        "systemd.mask=freshroot-update.service systemd.mask=freshroot-update.timer"
+fi
+
+# ==========================================================================
+# Submenus: one per snapshot, each listing all compatible kernels
+# ==========================================================================
+if [ -n "$SNAPSHOTS" ]; then
+    _has_entries=0
+    for snap in $SNAPSHOTS; do
+        if best_kernel_for "${SNAPSHOT_DIR}/${snap}"; then
+            _has_entries=1
+            break
+        fi
+    done
+
+    if [ "$_has_entries" = "1" ]; then
+        echo "submenu '${LABEL} — Snapshot History' --class ubuntu {"
+
+        for snap in $SNAPSHOTS; do
+            SNAP_KERNELS=$(kernels_for "${SNAPSHOT_DIR}/${snap}")
+            [ -z "$SNAP_KERNELS" ] && continue
+
+            TS=$(echo "$snap" | sed 's/root\.//')
+            DISPLAY_TS=$(echo "$TS" | sed 's/\(....\)\(..\)\(..\)T\(..\)\(..\)\(..\)/\1-\2-\3 \4:\5:\6/')
+
+            echo "  submenu '${DISPLAY_TS} (${snap})' --class ubuntu {"
+
+            for krel in $SNAP_KERNELS; do
+                BK_REL="$krel"
+                BK_VMLINUZ="/vmlinuz-${krel}"
+                BK_INITRD="/initrd.img-${krel}"
+
+                emit_entry \
+                    "    kernel ${krel}" \
+                    "@snapshots/${snap}" \
+                    "yes" \
+                    ""
+            done
+
+            echo "  }"
+        done
+
+        echo "}"
+    fi
+fi

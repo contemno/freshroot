@@ -3,7 +3,7 @@ set -e
 
 case "$1" in
     remove|purge)
-        systemctl disable --now immutable-update.timer 2>/dev/null || true
+        systemctl disable --now freshroot-update.timer 2>/dev/null || true
         systemctl disable machine-id-persist.service 2>/dev/null || true
         ;;
 esac
