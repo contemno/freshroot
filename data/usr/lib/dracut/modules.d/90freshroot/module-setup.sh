@@ -10,6 +10,7 @@ depends() {
     echo "btrfs"
 }
 
+# shellcheck disable=SC2154  # moddir and initdir are provided by dracut
 install() {
     # systemd generator — creates the service + sysroot.mount drop-in
     inst_simple "$moddir/freshroot-generator" \

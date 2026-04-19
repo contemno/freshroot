@@ -19,7 +19,7 @@ if [[ ! -f "$CONF" ]]; then
     echo "ERROR: config not found at $CONF" >&2
     exit 1
 fi
-# shellcheck source=/etc/freshroot-update.conf
+# shellcheck source=/dev/null
 source "$CONF"
 
 # ── Globals ──────────────────────────────────────────────────────────

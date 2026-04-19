@@ -50,6 +50,7 @@ if ! mount -t btrfs -o subvolid=5 "$DEV" "$TOPLEVEL"; then
 fi
 
 cleanup() {
+    # shellcheck disable=SC2317  # invoked via trap
     umount "$TOPLEVEL" 2>/dev/null || true
 }
 trap cleanup EXIT
