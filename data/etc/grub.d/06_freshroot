@@ -22,7 +22,7 @@ set -e
 
 # --- Configuration ---
 EDITION=""
-# shellcheck source=/etc/freshroot-update.conf
+# shellcheck source=/dev/null
 [ -r /etc/freshroot-update.conf ] && . /etc/freshroot-update.conf
 
 # Build the label: "Freshroot" or "Freshroot Workstation" etc.
@@ -59,7 +59,7 @@ if [ -n "$CRYPT_UUID" ]; then
 fi
 
 # --- Collect all kernels available in /boot, newest first ---
-ALL_BOOT_KERNELS=$(ls /boot/vmlinuz-* 2>/dev/null | sed 's|.*/vmlinuz-||' | sort -rV)
+ALL_BOOT_KERNELS=$(for f in /boot/vmlinuz-*; do [ -e "$f" ] && echo "${f##*/vmlinuz-}"; done | sort -rV)
 
 if [ -z "$ALL_BOOT_KERNELS" ]; then
     echo "Warning: No kernels found in /boot" >&2
@@ -188,8 +188,12 @@ if [ -n "$SNAPSHOTS" ]; then
             SNAP_KERNELS=$(kernels_for "${SNAPSHOT_DIR}/${snap}")
             [ -z "$SNAP_KERNELS" ] && continue
 
-            TS=$(echo "$snap" | sed 's/root\.//')
-            DISPLAY_TS=$(echo "$TS" | sed 's/\(....\)\(..\)\(..\)T\(..\)\(..\)\(..\)/\1-\2-\3 \4:\5:\6/')
+            TS="${snap#root.}"
+            if [[ "$TS" =~ ^(....)(..)(..)T(..)(..)(..)$ ]]; then
+                DISPLAY_TS="${BASH_REMATCH[1]}-${BASH_REMATCH[2]}-${BASH_REMATCH[3]} ${BASH_REMATCH[4]}:${BASH_REMATCH[5]}:${BASH_REMATCH[6]}"
+            else
+                DISPLAY_TS="$TS"
+            fi
 
             echo "  submenu '${DISPLAY_TS} (${snap})' --class ubuntu {"
 
