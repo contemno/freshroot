@@ -32,6 +32,9 @@ jobs:
       image: ubuntu:noble
     env:
       DEBIAN_FRONTEND: noninteractive
+    defaults:
+      run:
+        shell: bash
 
     steps:
       - name: Install build dependencies
