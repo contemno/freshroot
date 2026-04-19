@@ -1,5 +1,8 @@
-#!/bin/sh
+#!/bin/bash
 # /etc/grub.d/06_freshroot
+#
+# Runs under bash (not sh) so it can source /etc/freshroot-update.conf,
+# which uses bash array syntax for REPOS and BIND_MOUNTS.
 #
 # Generates GRUB menu entries for the freshroot boot model:
 #
