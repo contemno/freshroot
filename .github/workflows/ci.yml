@@ -29,12 +29,19 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: ubuntu:noble
+    env:
+      DEBIAN_FRONTEND: noninteractive
     steps:
       - name: Install build dependencies
         run: |
+          set -eux
           apt-get update
           apt-get install -y --no-install-recommends \
-            build-essential dpkg-dev debhelper devscripts git
+            ca-certificates \
+            build-essential \
+            dpkg-dev \
+            debhelper \
+            git
 
       - uses: actions/checkout@v4
 
@@ -43,5 +50,6 @@ jobs:
 
       - name: Verify package contents
         run: |
+          set -eux
           dpkg-deb -c ../freshroot_*.deb
           dpkg-deb -I ../freshroot_*.deb
