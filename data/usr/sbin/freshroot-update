@@ -129,6 +129,11 @@ if [[ -n "$EFI_PARTITION" && "$EFI_PARTITION" != "$BOOT_PARTITION" ]]; then
         || die "failed to bind-mount $EFI_PARTITION"
 fi
 
+# ── Persist the apt cache across updates ─────────────────────────────
+# Bind the @apt-cache subvolume into the container so downloaded .debs
+# aren't discarded when @staging is deleted.
+APT_CACHE_BIND=("--bind=${TOPLEVEL}/@apt-cache:/var/cache/apt")
+
 # ── Build extra bind-mount flags from BIND_MOUNTS ────────────────────
 # Each entry is "HOST:CONTAINER[:ro]". Read-only entries become
 # --bind-ro=HOST:CONTAINER, others become --bind=HOST:CONTAINER.
@@ -207,6 +212,12 @@ protect_snapshot_kernels() {
 protect_snapshot_kernels "$SNAP_PATH" "$STAGING_PATH"
 
 # ── Run updates inside nspawn container ──────────────────────────────
+# Disable nspawn's default seccomp filter. Network-heavy workloads
+# (apt, git clone) are syscall-heavy; the filter adds measurable
+# overhead. Staging runs trusted code, so the security trade-off is
+# acceptable. Set SYSTEMD_LOG_SECCOMP=1 externally to debug.
+export SYSTEMD_SECCOMP=0
+
 NSPAWN_RC=0
 
 if [[ $INTERACTIVE -eq 1 ]]; then
@@ -217,6 +228,7 @@ if [[ $INTERACTIVE -eq 1 ]]; then
         --resolv-conf=bind-stub
         --setenv=DEBIAN_FRONTEND=noninteractive
         --console=interactive
+        "${APT_CACHE_BIND[@]}"
         "${EXTRA_BINDS[@]}"
     )
 
@@ -257,6 +269,7 @@ elif [[ $PROVISION_ONLY -eq 1 ]]; then
         --directory="$STAGING_PATH" \
         --resolv-conf=bind-stub \
         --setenv=DEBIAN_FRONTEND=noninteractive \
+        "${APT_CACHE_BIND[@]}" \
         "${EXTRA_BINDS[@]}" \
         --quiet \
         --console=pipe \
@@ -288,6 +301,7 @@ else
         --resolv-conf=bind-stub \
         --setenv=DEBIAN_FRONTEND=noninteractive \
         --setenv=_FRESHROOT_REPOS="$REPOS_JOINED" \
+        "${APT_CACHE_BIND[@]}" \
         "${EXTRA_BINDS[@]}" \
         --quiet \
         --console=pipe \
