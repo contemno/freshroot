@@ -30,13 +30,20 @@ jobs:
       prerelease: ${{ steps.version.outputs.prerelease }}
     container:
       image: ubuntu:noble
+    env:
+      DEBIAN_FRONTEND: noninteractive
 
     steps:
       - name: Install build dependencies
         run: |
+          set -eux
           apt-get update
           apt-get install -y --no-install-recommends \
-            build-essential dpkg-dev debhelper devscripts git
+            ca-certificates \
+            build-essential \
+            dpkg-dev \
+            debhelper \
+            git
 
       - uses: actions/checkout@v4
         with:
@@ -46,6 +53,7 @@ jobs:
       - name: Derive version from tag
         id: version
         run: |
+          set -euo pipefail
           TAG="${GITHUB_REF#refs/tags/v}"
           if echo "$TAG" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
             DEB_VERSION="${TAG}-1"
@@ -64,8 +72,15 @@ jobs:
           TAG="${GITHUB_REF#refs/tags/}"
           VERSION="${{ steps.version.outputs.deb_version }}"
 
+          # actions/checkout fetches annotated tag objects only when the
+          # tag ref was created on the remote before the fetch. Re-fetch
+          # the tag explicitly so %(contents) has a tag object to read.
+          git config --global --add safe.directory "$PWD"
+          git fetch --no-recurse-submodules --force origin \
+            "+refs/tags/${TAG}:refs/tags/${TAG}" || true
+
           # Pull the tag message body (empty for lightweight tags)
-          MSG=$(git for-each-ref --format='%(contents)' "refs/tags/${TAG}")
+          MSG=$(git for-each-ref --format='%(contents)' "refs/tags/${TAG}" || true)
           MSG="${MSG%$'\n'}"
           if [ -z "$MSG" ]; then
             echo "WARNING: no annotated tag message for ${TAG}; using stub" >&2
@@ -74,7 +89,7 @@ jobs:
 
           # Format tag message as changelog entries. Each non-empty line
           # becomes "  * <line>" unless it's already bulleted/indented.
-          ENTRIES=$(echo "$MSG" | awk '
+          ENTRIES=$(printf '%s\n' "$MSG" | awk '
             /^[[:space:]]*$/ { print ""; next }
             /^[[:space:]]*\*/ { print "  " $0; next }
             /^[[:space:]]/   { print $0; next }
@@ -83,22 +98,23 @@ jobs:
 
           DATE=$(date -R)
           {
-            echo "freshroot (${VERSION}) noble; urgency=medium"
-            echo
-            echo "${ENTRIES}"
-            echo
-            echo " -- GitHub Actions <actions@github.com>  ${DATE}"
-            echo
+            printf '%s\n\n' "freshroot (${VERSION}) noble; urgency=medium"
+            printf '%s\n\n' "${ENTRIES}"
+            printf '%s\n\n' " -- GitHub Actions <actions@github.com>  ${DATE}"
             cat debian/changelog
           } > debian/changelog.new
           mv debian/changelog.new debian/changelog
           head -30 debian/changelog
+
+          # Sanity-check the generated stanza parses cleanly.
+          dpkg-parsechangelog -l debian/changelog >/dev/null
 
       - name: Build package
         run: dpkg-buildpackage -us -uc -b
 
       - name: Collect artifacts
         run: |
+          set -eux
           mkdir -p artifacts
           cp ../*.deb ../*.buildinfo ../*.changes artifacts/
           install -m 0755 installer/freshroot-setup artifacts/
