@@ -39,6 +39,9 @@ jobs:
             build-essential dpkg-dev debhelper devscripts git
 
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
 
       - name: Derive version from tag
         id: version
@@ -55,13 +58,41 @@ jobs:
           echo "prerelease=${PRERELEASE}" >> "$GITHUB_OUTPUT"
           echo "Version: ${DEB_VERSION} (prerelease=${PRERELEASE})"
 
-      - name: Stamp debian/changelog with tag version
+      - name: Stamp debian/changelog from annotated tag
         run: |
-          DEBFULLNAME="GitHub Actions" \
-          DEBEMAIL="actions@github.com" \
-          dch --newversion "${{ steps.version.outputs.deb_version }}" \
-              --distribution noble \
-              "Release ${GITHUB_REF#refs/tags/}"
+          set -euo pipefail
+          TAG="${GITHUB_REF#refs/tags/}"
+          VERSION="${{ steps.version.outputs.deb_version }}"
+
+          # Pull the tag message body (empty for lightweight tags)
+          MSG=$(git for-each-ref --format='%(contents)' "refs/tags/${TAG}")
+          MSG="${MSG%$'\n'}"
+          if [ -z "$MSG" ]; then
+            echo "WARNING: no annotated tag message for ${TAG}; using stub" >&2
+            MSG="Release ${TAG}"
+          fi
+
+          # Format tag message as changelog entries. Each non-empty line
+          # becomes "  * <line>" unless it's already bulleted/indented.
+          ENTRIES=$(echo "$MSG" | awk '
+            /^[[:space:]]*$/ { print ""; next }
+            /^[[:space:]]*\*/ { print "  " $0; next }
+            /^[[:space:]]/   { print $0; next }
+                             { print "  * " $0 }
+          ')
+
+          DATE=$(date -R)
+          {
+            echo "freshroot (${VERSION}) noble; urgency=medium"
+            echo
+            echo "${ENTRIES}"
+            echo
+            echo " -- GitHub Actions <actions@github.com>  ${DATE}"
+            echo
+            cat debian/changelog
+          } > debian/changelog.new
+          mv debian/changelog.new debian/changelog
+          head -30 debian/changelog
 
       - name: Build package
         run: dpkg-buildpackage -us -uc -b

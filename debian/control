@@ -1,7 +1,7 @@
 Source: freshroot
 Section: admin
 Priority: optional
-Maintainer: Joshua <joshua@example.com>
+Maintainer: Joshua Miller <freshroot@lamille.net>
 Build-Depends: debhelper-compat (= 13)
 Standards-Version: 4.6.2
 
