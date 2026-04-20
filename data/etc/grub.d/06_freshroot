@@ -130,6 +130,20 @@ menuentry '${_title}' --class ubuntu --class gnu-linux --class os {
 ENTRY
 }
 
+# --- Ensure /.snapshots is mounted ---
+# update-grub can be invoked outside freshroot-update (manual runs,
+# kernel postinst, dpkg-reconfigure grub-pc). Self-mount so the snapshot
+# submenu is generated regardless of caller. Clean up on exit.
+_SNAPSHOT_UNMOUNT=0
+if [ -d "$SNAPSHOT_DIR" ] && ! mountpoint -q "$SNAPSHOT_DIR"; then
+    _SNAP_SUBVOL="${SNAPSHOTS_DIR:-@snapshots}"
+    if mount -t btrfs -o "subvol=${_SNAP_SUBVOL},noatime" \
+            "$BTRFS_DEVICE" "$SNAPSHOT_DIR" 2>/dev/null; then
+        _SNAPSHOT_UNMOUNT=1
+        trap '[ "$_SNAPSHOT_UNMOUNT" = "1" ] && umount "$SNAPSHOT_DIR" 2>/dev/null || true' EXIT
+    fi
+fi
+
 # --- Find snapshots ---
 SNAPSHOTS=""
 if [ -d "$SNAPSHOT_DIR" ]; then

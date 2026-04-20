@@ -400,14 +400,9 @@ if [[ "${MAX_SNAPSHOTS:-0}" -gt 0 ]]; then
 fi
 
 # ── Update GRUB to pick up the new snapshot ──────────────────────────
-# Mount @snapshots so 06_freshroot can discover them
-SNAP_MOUNT="/.snapshots"
-BTRFS_DEV_FOR_MOUNT=$(findmnt -n -o SOURCE / | head -1)
-BTRFS_DEV_FOR_MOUNT="${BTRFS_DEV_FOR_MOUNT%%\[*}"
-mount -t btrfs -o subvol=@snapshots,noatime "$BTRFS_DEV_FOR_MOUNT" "$SNAP_MOUNT" 2>/dev/null || true
+# 06_freshroot self-mounts /.snapshots when needed.
 info "regenerating GRUB configuration"
 update-grub 2>&1 | tee -a "$LOG_FILE" || warn "update-grub failed"
-umount "$SNAP_MOUNT" 2>/dev/null || true
 
 info "=== freshroot-update completed successfully ==="
 info "New snapshot ${STAMP} is ready. Reboot to apply."
