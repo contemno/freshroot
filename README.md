@@ -44,6 +44,7 @@ Runs manually or every 4 hours via the systemd timer:
 3. Enter `@staging` with `systemd-nspawn`, bind-mounting:
    - `/boot` and `/boot/efi` so kernel/GRUB updates land on the real boot partition.
    - `@apt-cache` onto `/var/cache/apt` so downloaded `.deb` files persist across runs.
+   - The btrfs top-level (subvolid=5) at `/run/freshroot-toplevel` so `install.sh` can manage top-level subvolumes (`btrfs subvolume create /run/freshroot-toplevel/@whatever`). This exposes all subvolumes rw to the container — only list trusted entries in `REPOS`.
    - Any host paths listed in `BIND_MOUNTS` (for local dev or shipping secrets).
 4. Before apt runs, scan all existing snapshots for in-use kernel versions and `apt-mark hold` them so `autoremove` can't delete kernels older snapshots depend on.
 5. Inside the container: `apt full-upgrade`, cloud-init provisioning (`cloud-init init --local`, `init`, `modules --mode={config,final}`), then clone and run `./install.sh` from each repo listed in `REPOS`. Entries using the `local://<path>` scheme skip the clone and run `install.sh` directly (pair with `BIND_MOUNTS` to test uncommitted code).

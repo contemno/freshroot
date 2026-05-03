@@ -134,6 +134,15 @@ fi
 # aren't discarded when @staging is deleted.
 APT_CACHE_BIND=("--bind=${TOPLEVEL}/@apt-cache:/var/cache/apt")
 
+# ── Expose btrfs top-level (subvolid=5) inside the container ─────────
+# Lets a repo's install.sh manage top-level subvolumes, e.g.:
+#   btrfs subvolume create /run/freshroot-toplevel/@whatever
+# CAP_SYS_ADMIN is in nspawn's default capability set and seccomp is
+# disabled below, so subvolume operations work without extra flags.
+# Note: this exposes ALL subvolumes (including @home, @log, @snapshots)
+# rw to the container — only list trusted entries in REPOS.
+TOPLEVEL_BIND=("--bind=${TOPLEVEL}:/run/freshroot-toplevel")
+
 # ── Build extra bind-mount flags from BIND_MOUNTS ────────────────────
 # Each entry is "HOST:CONTAINER[:ro]". Read-only entries become
 # --bind-ro=HOST:CONTAINER, others become --bind=HOST:CONTAINER.
@@ -229,6 +238,7 @@ if [[ $INTERACTIVE -eq 1 ]]; then
         --setenv=DEBIAN_FRONTEND=noninteractive
         --console=interactive
         "${APT_CACHE_BIND[@]}"
+        "${TOPLEVEL_BIND[@]}"
         "${EXTRA_BINDS[@]}"
     )
 
@@ -270,6 +280,7 @@ elif [[ $PROVISION_ONLY -eq 1 ]]; then
         --resolv-conf=bind-stub \
         --setenv=DEBIAN_FRONTEND=noninteractive \
         "${APT_CACHE_BIND[@]}" \
+        "${TOPLEVEL_BIND[@]}" \
         "${EXTRA_BINDS[@]}" \
         --quiet \
         --console=pipe \
@@ -302,6 +313,7 @@ else
         --setenv=DEBIAN_FRONTEND=noninteractive \
         --setenv=_FRESHROOT_REPOS="$REPOS_JOINED" \
         "${APT_CACHE_BIND[@]}" \
+        "${TOPLEVEL_BIND[@]}" \
         "${EXTRA_BINDS[@]}" \
         --quiet \
         --console=pipe \
