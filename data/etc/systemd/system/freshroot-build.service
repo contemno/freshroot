@@ -1,0 +1,19 @@
+[Unit]
+Description=Immutable root build (two-tier: vanilla @base + component layer)
+Documentation=file:///etc/freshroot-update.conf
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/freshroot-build
+# Longer than freshroot-update: this upgrades @base AND builds the component layer
+TimeoutStartSec=7200
+# Keep the nspawn container's child processes confined
+KillMode=mixed
+# Journald will capture stdout/stderr alongside the log file
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
