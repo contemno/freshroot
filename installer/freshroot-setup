@@ -258,6 +258,9 @@ info "Phase 9: Creating baseline snapshot"
 # per-lineage retention and GRUB grouping work from the first boot. The
 # os-release is parsed (never sourced); an unreadable one falls back to the
 # legacy root.<timestamp> name, which the runtime tools resolve lazily.
+# SYNC: this derivation mirrors lineage_of_root in freshroot-update /
+# freshroot-build / freshroot-install / 06_freshroot — if the parsing or
+# sanitization rules change there, change them here too.
 OSR=""
 if [ -r "$T/usr/lib/os-release" ]; then
     OSR="$T/usr/lib/os-release"

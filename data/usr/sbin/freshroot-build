@@ -14,14 +14,14 @@
 # component removed from REPOS simply never reappears: it never touched @base,
 # so nothing it installed can linger in future snapshots.
 #
-# Boot selection is unchanged: 06_freshroot sorts @snapshots/root.* and boots
-# the newest, so the snapshot produced here boots with no GRUB/initramfs change.
+# Boot selection is unchanged: 06_freshroot boots each lineage's newest
+# snapshot, so the snapshot produced here boots with no GRUB/initramfs change.
 #
 # NOTE: the helpers resolve_btrfs_device, protect_snapshot_kernels, the bind
 # arrays, the lineage/prune helpers and die/info/warn are intentionally COPIED
 # from /usr/sbin/freshroot-update (the tools must not share a library per the
 # "edit minimum / new utility alongside" design). If you fix a bug in one, fix
-# it in freshroot-update, freshroot-install and (sh-dialect) 06_freshroot too.
+# it in freshroot-update, freshroot-install and (partial copy) 06_freshroot too.
 # See the Sync-Point Checklist in the project plan.
 set -euo pipefail
 
@@ -72,6 +72,7 @@ TS="$(date +%Y%m%dT%H%M%S)"
 # (both manipulate @staging, the top-level mount and update-grub).
 LOCKFILE="/run/freshroot-update.lock"
 LOG_FILE="${LOG_DIR}/build-${TS}.log"
+DEFAULT_LINEAGE_FILE="/boot/freshroot/default-lineage"
 
 # Defaults in case an older config predates these keys
 BASE_SUBVOL="${BASE_SUBVOL:-@base}"
@@ -114,9 +115,12 @@ umount_boot_binds() {
 #   root.<TS>             legacy; lineage resolved from the tree's os-release
 # TS is always the LAST dot-field and must match ^[0-9]{8}T[0-9]{6}$.
 # Names without a valid TS field are exempt from pruning and latest-selection.
-# SYNC: these helpers are copied in freshroot-update, freshroot-build and
-# freshroot-install, and (sh-dialect, ||-guarded, no set -u/pipefail) in
-# /etc/grub.d/06_freshroot. Fix all four together.
+# SYNC: these helpers are copied between freshroot-update, freshroot-build
+# and freshroot-install (each omits helpers it does not use); a partial,
+# ||-guarded copy (snap_ts, snap_label, lineage_of_root, snapshot_lineage —
+# bash, but running under plain `set -e` without -u/pipefail) lives in
+# /etc/grub.d/06_freshroot, and installer/freshroot-setup Phase 9 re-derives
+# the lineage with the same parsing rules. Fix every copy together.
 
 # Timestamp field of a snapshot name; empty if the name has none.
 snap_ts() {
@@ -231,6 +235,16 @@ current_lineage() {
     fi
 }
 
+# Record the default boot lineage on first lineage-aware run so GRUB ordering
+# is sticky (changed only by freshroot-install --switch).
+ensure_default_lineage() {
+    local lin="$1"
+    [[ -n "$lin" && "$lin" != "unknown" ]] || return 0
+    [[ -s "$DEFAULT_LINEAGE_FILE" ]] && return 0
+    mkdir -p "$(dirname "$DEFAULT_LINEAGE_FILE")" 2>/dev/null || return 0
+    echo "$lin" > "$DEFAULT_LINEAGE_FILE" 2>/dev/null || true
+}
+
 # ── Prune old snapshots (per-lineage quotas) ─────────────────────────
 # Each lineage is pruned to its own quota; lineage "unknown" (unreadable
 # os-release) is never pruned automatically.
@@ -277,16 +291,26 @@ prune_snapshots() {
 # the authoritative update-grub after commit.
 suppress_staging_update_grub() {
     local root="$1"
-    chroot "$root" dpkg-divert --local --rename \
+    # dpkg-divert (not a plain overwrite) so an apt upgrade of grub2-common
+    # inside the container still unpacks cleanly (dpkg honors diversions).
+    # Only plant the symlink when the divert succeeded: otherwise the
+    # symlink+restore would delete the tree's REAL update-grub.
+    if chroot "$root" dpkg-divert --local --rename \
         --divert /usr/sbin/update-grub.freshroot-diverted \
-        --add /usr/sbin/update-grub >/dev/null 2>&1 || true
-    ln -sf /bin/true "${root}/usr/sbin/update-grub"
+        --add /usr/sbin/update-grub >/dev/null 2>&1; then
+        ln -sf /bin/true "${root}/usr/sbin/update-grub"
+    else
+        warn "could not divert update-grub in staging — the container may write grub.cfg"
+    fi
 }
 restore_staging_update_grub() {
     local root="$1"
-    rm -f "${root}/usr/sbin/update-grub"
-    chroot "$root" dpkg-divert --local --rename \
-        --remove /usr/sbin/update-grub >/dev/null 2>&1 || true
+    if [[ -L "${root}/usr/sbin/update-grub" && \
+          "$(readlink "${root}/usr/sbin/update-grub")" == "/bin/true" ]]; then
+        rm -f "${root}/usr/sbin/update-grub"
+        chroot "$root" dpkg-divert --local --rename \
+            --remove /usr/sbin/update-grub >/dev/null 2>&1 || true
+    fi
 }
 
 cleanup() {
@@ -471,7 +495,11 @@ protect_snapshot_kernels() {
         done
     fi
 
-    # Release stale holds (kernel packages whose version is now unreferenced)
+    # Release stale holds (kernel packages whose version is now unreferenced).
+    # Only packages whose stripped remainder LOOKS like a kernel version are
+    # candidates — meta/unsigned/vendor names (linux-image-generic,
+    # linux-image-unsigned-<kver>, linux-modules-nvidia-*) were never held by
+    # this tool and admin holds on them must survive.
     local held unhold_pkgs=()
     held=$(chroot "$staging" apt-mark showhold 2>/dev/null \
            | grep -E '^(linux-image|linux-modules|linux-modules-extra)-' || true)
@@ -481,6 +509,7 @@ protect_snapshot_kernels() {
         kv="${kv#linux-image-}"
         kv="${kv#linux-modules-extra-}"
         kv="${kv#linux-modules-}"
+        [[ "$kv" =~ ^[0-9]+\.[0-9]+ ]] || continue
         if [[ -z "${in_use[$kv]:-}" ]]; then
             unhold_pkgs+=("$pkg")
         fi
@@ -697,6 +726,8 @@ btrfs subvolume snapshot -r "$STAGING_PATH" "$NEW_SNAP" \
 
 btrfs subvolume delete "$STAGING_PATH" || warn "could not delete staging subvol"
 info "staging subvolume removed"
+
+ensure_default_lineage "$(current_lineage)"
 
 # ── Prune old snapshots (per-lineage quotas) ─────────────────────────
 prune_snapshots

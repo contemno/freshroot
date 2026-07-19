@@ -21,42 +21,32 @@
 # intentionally COPIED from /usr/sbin/freshroot-update (the tools must not
 # share a library per the "edit minimum / new utility alongside" design).
 # If you fix a bug in one, fix it in freshroot-update, freshroot-build and
-# (sh-dialect) 06_freshroot too.
+# (partial copy) 06_freshroot too.
 set -euo pipefail
 
 MODE=""
-RELEASE_ARG=""
-IMPORT_SRC=""
-SWITCH_ARG=""
-REMOVE_ARG=""
+MODE_ARG=""
 FROM_REF=""
 LINEAGE_FLAG=""
 MERGE=0
 FORCE=0
 
+# All four modes are mutually exclusive and take exactly one argument,
+# which lands in MODE_ARG.
 set_mode() {
     [[ -z "$MODE" ]] || { echo "freshroot-install: only one of --release/--import/--switch/--remove may be given" >&2; exit 1; }
     MODE="$1"
+    MODE_ARG="$2"
 }
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --release)
-            [[ $# -ge 2 ]] || { echo "freshroot-install: --release requires an argument" >&2; exit 1; }
-            set_mode release; RELEASE_ARG="$2"; shift ;;
-        --release=*) set_mode release; RELEASE_ARG="${1#--release=}" ;;
-        --import)
-            [[ $# -ge 2 ]] || { echo "freshroot-install: --import requires an argument" >&2; exit 1; }
-            set_mode import; IMPORT_SRC="$2"; shift ;;
-        --import=*)  set_mode import; IMPORT_SRC="${1#--import=}" ;;
-        --switch)
-            [[ $# -ge 2 ]] || { echo "freshroot-install: --switch requires an argument" >&2; exit 1; }
-            set_mode switch; SWITCH_ARG="$2"; shift ;;
-        --switch=*)  set_mode switch; SWITCH_ARG="${1#--switch=}" ;;
-        --remove)
-            [[ $# -ge 2 ]] || { echo "freshroot-install: --remove requires an argument" >&2; exit 1; }
-            set_mode remove; REMOVE_ARG="$2"; shift ;;
-        --remove=*)  set_mode remove; REMOVE_ARG="${1#--remove=}" ;;
+        --release|--import|--switch|--remove)
+            [[ $# -ge 2 ]] || { echo "freshroot-install: $1 requires an argument" >&2; exit 1; }
+            set_mode "${1#--}" "$2"; shift ;;
+        --release=*|--import=*|--switch=*|--remove=*)
+            _flag="${1%%=*}"
+            set_mode "${_flag#--}" "${1#*=}" ;;
         --from)
             [[ $# -ge 2 ]] || { echo "freshroot-install: --from requires an argument" >&2; exit 1; }
             FROM_REF="$2"; shift ;;
@@ -98,6 +88,15 @@ done
 
 [[ -n "$MODE" ]] || { echo "freshroot-install: one of --release/--import/--switch/--remove is required (see --help)" >&2; exit 1; }
 
+# Lineage labels land in snapshot names and on the kernel command line
+# (rootflags=subvol=...), so they must stay shell/cmdline-safe.
+if [[ -n "$LINEAGE_FLAG" ]]; then
+    if [[ ! "$LINEAGE_FLAG" =~ ^[a-z0-9][a-z0-9._-]*$ || "$LINEAGE_FLAG" == "unknown" ]]; then
+        echo "freshroot-install: invalid --lineage '${LINEAGE_FLAG}' (allowed: lowercase alphanumerics, dot, dash, underscore; 'unknown' is reserved)" >&2
+        exit 1
+    fi
+fi
+
 CONF="/etc/freshroot-update.conf"
 if [[ ! -f "$CONF" ]]; then
     echo "ERROR: config not found at $CONF" >&2
@@ -108,6 +107,8 @@ LINEAGE_QUOTAS=()
 # shellcheck source=/dev/null
 source "$CONF"
 BASE_SUBVOL="${BASE_SUBVOL:-@base}"
+ROOT_SUBVOL="${ROOT_SUBVOL:-@}"
+ROOTFS_SUBVOL="${ROOTFS_SUBVOL:-@rootfs}"
 
 # ── Globals ──────────────────────────────────────────────────────────
 TOPLEVEL="/run/freshroot-install/btrfs-toplevel"
@@ -178,9 +179,12 @@ trap cleanup EXIT
 #   root.<TS>             legacy; lineage resolved from the tree's os-release
 # TS is always the LAST dot-field and must match ^[0-9]{8}T[0-9]{6}$.
 # Names without a valid TS field are exempt from pruning and latest-selection.
-# SYNC: these helpers are copied in freshroot-update, freshroot-build and
-# freshroot-install, and (sh-dialect, ||-guarded, no set -u/pipefail) in
-# /etc/grub.d/06_freshroot. Fix all four together.
+# SYNC: these helpers are copied between freshroot-update, freshroot-build
+# and freshroot-install (each omits helpers it does not use); a partial,
+# ||-guarded copy (snap_ts, snap_label, lineage_of_root, snapshot_lineage —
+# bash, but running under plain `set -e` without -u/pipefail) lives in
+# /etc/grub.d/06_freshroot, and installer/freshroot-setup Phase 9 re-derives
+# the lineage with the same parsing rules. Fix every copy together.
 
 # Timestamp field of a snapshot name; empty if the name has none.
 snap_ts() {
@@ -360,22 +364,34 @@ prune_snapshots() {
 # the authoritative update-grub after commit.
 suppress_staging_update_grub() {
     local root="$1"
-    chroot "$root" dpkg-divert --local --rename \
+    # dpkg-divert (not a plain overwrite) so an apt upgrade of grub2-common
+    # inside the container still unpacks cleanly (dpkg honors diversions).
+    # Only plant the symlink when the divert succeeded: otherwise the
+    # symlink+restore would delete the tree's REAL update-grub.
+    if chroot "$root" dpkg-divert --local --rename \
         --divert /usr/sbin/update-grub.freshroot-diverted \
-        --add /usr/sbin/update-grub >/dev/null 2>&1 || true
-    ln -sf /bin/true "${root}/usr/sbin/update-grub"
+        --add /usr/sbin/update-grub >/dev/null 2>&1; then
+        ln -sf /bin/true "${root}/usr/sbin/update-grub"
+    else
+        warn "could not divert update-grub in staging — the container may write grub.cfg"
+    fi
 }
 restore_staging_update_grub() {
     local root="$1"
-    rm -f "${root}/usr/sbin/update-grub"
-    chroot "$root" dpkg-divert --local --rename \
-        --remove /usr/sbin/update-grub >/dev/null 2>&1 || true
+    if [[ -L "${root}/usr/sbin/update-grub" && \
+          "$(readlink "${root}/usr/sbin/update-grub")" == "/bin/true" ]]; then
+        rm -f "${root}/usr/sbin/update-grub"
+        chroot "$root" dpkg-divert --local --rename \
+            --remove /usr/sbin/update-grub >/dev/null 2>&1 || true
+    fi
 }
 
 # ── Install-only helpers (NOT part of the synced corpus) ─────────────
 
 # os-release file of a root tree, chosen with the same symlink-safe rules
 # as lineage_of_root ('' if unreadable).
+# SYNC: keep the selection rules identical to lineage_of_root above (the
+# corpus copy stays self-contained, so the block exists twice in this file).
 os_release_file() {
     local root="$1" f="" tgt
     if [[ -r "${root}/usr/lib/os-release" && ! -L "${root}/usr/lib/os-release" ]]; then
@@ -427,6 +443,7 @@ csv_next_lts_series() {
 }
 
 # Resolve --from (snapshot name or lineage) to a snapshot path.
+# SYNC: copied in freshroot-update — fix both.
 resolve_from_ref() {
     local ref="$1" cand
     cand="${ref#"${SNAPSHOTS_DIR}"/}"
@@ -485,7 +502,8 @@ rewrite_list_file() {
     local f="$1" cur="$2" tgt="$3" tmp disabled_any=0
     local line uri host tok
     tmp=$(mktemp)
-    while IFS= read -r line; do
+    # `|| [[ -n "$line" ]]` keeps a final line without a trailing newline
+    while IFS= read -r line || [[ -n "$line" ]]; do
         case "$line" in
             deb\ *|deb-src\ *|deb$'\t'*|deb-src$'\t'*)
                 uri=""
@@ -568,7 +586,11 @@ protect_snapshot_kernels() {
         done
     fi
 
-    # Release stale holds (kernel packages whose version is now unreferenced)
+    # Release stale holds (kernel packages whose version is now unreferenced).
+    # Only packages whose stripped remainder LOOKS like a kernel version are
+    # candidates — meta/unsigned/vendor names (linux-image-generic,
+    # linux-image-unsigned-<kver>, linux-modules-nvidia-*) were never held by
+    # this tool and admin holds on them must survive.
     local held unhold_pkgs=()
     held=$(chroot "$staging" apt-mark showhold 2>/dev/null \
            | grep -E '^(linux-image|linux-modules|linux-modules-extra)-' || true)
@@ -578,6 +600,7 @@ protect_snapshot_kernels() {
         kv="${kv#linux-image-}"
         kv="${kv#linux-modules-extra-}"
         kv="${kv#linux-modules-}"
+        [[ "$kv" =~ ^[0-9]+\.[0-9]+ ]] || continue
         if [[ -z "${in_use[$kv]:-}" ]]; then
             unhold_pkgs+=("$pkg")
         fi
@@ -645,6 +668,41 @@ STAGING_PATH="${TOPLEVEL}/${STAGING_SUBVOL}"
 
 [[ -d "$SNAP_PATH" ]] || die "snapshots directory not found at ${SNAP_PATH}"
 
+# ── Shared mode plumbing ─────────────────────────────────────────────
+run_update_grub() {
+    info "regenerating GRUB configuration"
+    update-grub 2>&1 | tee -a "$LOG_FILE" || warn "update-grub failed"
+}
+
+# Refuse to write into a lineage that already has snapshots (unless --merge).
+require_lineage_empty() {
+    local lin="$1"
+    [[ $MERGE -eq 1 ]] && return 0
+    [[ -z "$(latest_in_lineage "$lin")" ]] \
+        || die "lineage '${lin}' already has snapshots — use --merge to add to it"
+}
+
+clear_stale_staging() {
+    if btrfs subvolume show "$STAGING_PATH" &>/dev/null; then
+        warn "stale staging subvolume found — deleting"
+        btrfs subvolume delete "$STAGING_PATH" || die "cannot delete stale staging"
+    fi
+}
+
+# Commit @staging read-only into the given lineage; the snapshot name lands
+# in COMMITTED_NAME (a global — info/die log to stdout, so no $() capture).
+COMMITTED_NAME=""
+commit_staging_as() {
+    local lineage="$1" new_ts
+    new_ts="$(date +%Y%m%dT%H%M%S)"
+    COMMITTED_NAME="root.${lineage}.${new_ts}"
+    info "creating new read-only snapshot: ${SNAP_PATH}/${COMMITTED_NAME}"
+    btrfs subvolume snapshot -r "$STAGING_PATH" "${SNAP_PATH}/${COMMITTED_NAME}" \
+        || die "failed to create new read-only snapshot"
+    btrfs subvolume delete "$STAGING_PATH" || warn "could not delete staging subvol"
+    info "staging subvolume removed"
+}
+
 # ── Common post-commit steps ─────────────────────────────────────────
 finish_new_lineage() {
     local new_lineage="$1" new_name="$2"
@@ -652,8 +710,7 @@ finish_new_lineage() {
     ensure_default_lineage "$(current_lineage)"
     prune_snapshots
 
-    info "regenerating GRUB configuration"
-    update-grub 2>&1 | tee -a "$LOG_FILE" || warn "update-grub failed"
+    run_update_grub
 
     info "=== freshroot-install completed successfully ==="
     info "New snapshot in lineage '${new_lineage}': ${new_name}"
@@ -684,8 +741,7 @@ do_switch() {
     mkdir -p "$(dirname "$DEFAULT_LINEAGE_FILE")"
     echo "$lin" > "$DEFAULT_LINEAGE_FILE"
     info "default boot lineage set to '${lin}'"
-    info "regenerating GRUB configuration"
-    update-grub 2>&1 | tee -a "$LOG_FILE" || warn "update-grub failed"
+    run_update_grub
     info "=== freshroot-install --switch completed ==="
     info "Reboot to start '${lin}'."
 }
@@ -718,8 +774,7 @@ do_remove() {
     done
     [[ $failed -eq 0 ]] || die "some snapshots could not be deleted"
 
-    info "regenerating GRUB configuration"
-    update-grub 2>&1 | tee -a "$LOG_FILE" || warn "update-grub failed"
+    run_update_grub
     info "=== freshroot-install --remove completed ==="
     info "Lineage '${lin}' removed. Leftovers to clean up manually:"
     info "  - any \"${lin}=N\" entry in LINEAGE_QUOTAS (${CONF})"
@@ -731,6 +786,8 @@ do_remove() {
 # Mode: --release
 # ═════════════════════════════════════════════════════════════════════
 do_release() {
+    local release_arg="$1"
+
     # ── Source snapshot ──────────────────────────────────────────────
     local latest=""
     if [[ -n "$FROM_REF" ]]; then
@@ -753,14 +810,14 @@ do_release() {
     # ── Resolve the target release ───────────────────────────────────
     local csv target_codename="" target_version=""
     csv=$(ubuntu_csv_path "$latest")
-    if [[ "$RELEASE_ARG" =~ ^[0-9]+\.[0-9]+$ ]]; then
-        [[ -n "$csv" ]] || die "cannot resolve version '${RELEASE_ARG}' without distro-info-data — pass the codename instead (e.g. --release resolute)"
-        target_codename=$(csv_series_for_version "$RELEASE_ARG" "$csv")
-        [[ -n "$target_codename" ]] || die "unknown Ubuntu version '${RELEASE_ARG}' (distro-info-data too old?) — pass the codename instead"
-        target_version="$RELEASE_ARG"
+    if [[ "$release_arg" =~ ^[0-9]+\.[0-9]+$ ]]; then
+        [[ -n "$csv" ]] || die "cannot resolve version '${release_arg}' without distro-info-data — pass the codename instead (e.g. --release resolute)"
+        target_codename=$(csv_series_for_version "$release_arg" "$csv")
+        [[ -n "$target_codename" ]] || die "unknown Ubuntu version '${release_arg}' (distro-info-data too old?) — pass the codename instead"
+        target_version="$release_arg"
     else
-        target_codename=$(echo "$RELEASE_ARG" | tr '[:upper:]' '[:lower:]')
-        [[ "$target_codename" =~ ^[a-z]+$ ]] || die "invalid --release argument '${RELEASE_ARG}'"
+        target_codename=$(echo "$release_arg" | tr '[:upper:]' '[:lower:]')
+        [[ "$target_codename" =~ ^[a-z]+$ ]] || die "invalid --release argument '${release_arg}'"
         if [[ -n "$csv" ]]; then
             target_version=$(csv_version_for_series "$target_codename" "$csv")
         fi
@@ -798,16 +855,12 @@ do_release() {
     elif [[ -n "$target_version" ]]; then
         expected_lineage="${src_id}-${target_version}"
     fi
-    if [[ -n "$expected_lineage" && $MERGE -eq 0 ]]; then
-        [[ -z "$(latest_in_lineage "$expected_lineage")" ]] \
-            || die "lineage '${expected_lineage}' already has snapshots — use --merge to add to it"
+    if [[ -n "$expected_lineage" ]]; then
+        require_lineage_empty "$expected_lineage"
     fi
 
     # ── Stage the upgrade ────────────────────────────────────────────
-    if btrfs subvolume show "$STAGING_PATH" &>/dev/null; then
-        warn "stale staging subvolume found — deleting"
-        btrfs subvolume delete "$STAGING_PATH" || die "cannot delete stale staging"
-    fi
+    clear_stale_staging
     info "creating staging subvolume from snapshot"
     btrfs subvolume snapshot "$latest" "$STAGING_PATH" || die "failed to create staging snapshot"
 
@@ -845,7 +898,9 @@ apt-get full-upgrade -y \
 apt-get autoremove -y
 
 # Fail before commit if dpkg is left in a half-configured state
-audit=$(dpkg --audit)
+# (dpkg --audit exits non-zero when it finds problems — the || true keeps
+# `bash -e` from aborting before the diagnostics below are printed)
+audit=$(dpkg --audit || true)
 if [ -n "$audit" ]; then
     echo "$audit"
     echo "ERROR: dpkg --audit reports unconfigured packages" >&2
@@ -871,21 +926,10 @@ INNER
         || die "upgrade did not change the OS release (still ${new_derived}) — not committing"
 
     new_lineage="${LINEAGE_FLAG:-$new_derived}"
-    if [[ $MERGE -eq 0 ]]; then
-        [[ -z "$(latest_in_lineage "$new_lineage")" ]] \
-            || die "lineage '${new_lineage}' already has snapshots — use --merge to add to it"
-    fi
+    require_lineage_empty "$new_lineage"
 
-    local new_ts new_name
-    new_ts="$(date +%Y%m%dT%H%M%S)"
-    new_name="root.${new_lineage}.${new_ts}"
-    info "creating new read-only snapshot: ${SNAP_PATH}/${new_name}"
-    btrfs subvolume snapshot -r "$STAGING_PATH" "${SNAP_PATH}/${new_name}" \
-        || die "failed to create new read-only snapshot"
-    btrfs subvolume delete "$STAGING_PATH" || warn "could not delete staging subvol"
-    info "staging subvolume removed"
-
-    finish_new_lineage "$new_lineage" "$new_name"
+    commit_staging_as "$new_lineage"
+    finish_new_lineage "$new_lineage" "$COMMITTED_NAME"
 }
 
 # ═════════════════════════════════════════════════════════════════════
@@ -910,8 +954,8 @@ wire_import_tree() {
             esac
             target=$(awk '{print $2}' <<<"$line")
             case "$target" in
-                /|/boot|/boot/efi|/home|/var/log|/swap|none)
-                    printf '%s\n' "${line/subvol=@rootfs,/subvol=@,}"
+                /|"$BOOT_PARTITION"|"$EFI_PARTITION"|/home|/var/log|/swap|none)
+                    printf '%s\n' "${line/subvol=${ROOTFS_SUBVOL},/subvol=${ROOT_SUBVOL},}"
                     ;;
                 *)
                     echo "# freshroot: ${line}"
@@ -919,7 +963,7 @@ wire_import_tree() {
             esac
         done < /etc/fstab
     } > "${root}/etc/fstab"
-    mkdir -p "${root}/boot" "${root}${EFI_PARTITION}" "${root}/home" \
+    mkdir -p "${root}${BOOT_PARTITION}" "${root}${EFI_PARTITION}" "${root}/home" \
              "${root}/var/log" "${root}/swap" "${root}/.snapshots" "${root}/tmp"
 
     if [[ -f /etc/crypttab ]]; then
@@ -970,30 +1014,22 @@ wire_import_tree() {
 }
 
 do_import() {
+    local src="$1"
     [[ -n "$LINEAGE_FLAG" ]] || die "--import requires --lineage NAME (lineages are labels; an imported tree's os-release may collide with the host's)"
-    [[ "$LINEAGE_FLAG" =~ ^[a-z0-9][a-z0-9._-]*$ ]] \
-        || die "invalid --lineage '${LINEAGE_FLAG}' (allowed: lowercase alphanumerics, dot, dash, underscore)"
-    [[ "$LINEAGE_FLAG" != "unknown" ]] || die "--lineage 'unknown' is reserved"
-    if [[ $MERGE -eq 0 ]]; then
-        [[ -z "$(latest_in_lineage "$LINEAGE_FLAG")" ]] \
-            || die "lineage '${LINEAGE_FLAG}' already has snapshots — use --merge to add to it"
-    fi
+    require_lineage_empty "$LINEAGE_FLAG"
 
-    if btrfs subvolume show "$STAGING_PATH" &>/dev/null; then
-        warn "stale staging subvolume found — deleting"
-        btrfs subvolume delete "$STAGING_PATH" || die "cannot delete stale staging"
-    fi
+    clear_stale_staging
     btrfs subvolume create "$STAGING_PATH" || die "failed to create staging subvolume"
 
-    if [[ -d "$IMPORT_SRC" ]]; then
-        info "copying rootfs from directory ${IMPORT_SRC}"
-        cp -a "$IMPORT_SRC"/. "$STAGING_PATH"/ || die "rootfs copy failed"
-    elif [[ -f "$IMPORT_SRC" ]]; then
-        info "extracting rootfs archive ${IMPORT_SRC}"
+    if [[ -d "$src" ]]; then
+        info "copying rootfs from directory ${src}"
+        cp -a "$src"/. "$STAGING_PATH"/ || die "rootfs copy failed"
+    elif [[ -f "$src" ]]; then
+        info "extracting rootfs archive ${src}"
         tar --numeric-owner --xattrs --xattrs-include='*' \
-            -xpf "$IMPORT_SRC" -C "$STAGING_PATH" || die "rootfs extraction failed"
+            -xpf "$src" -C "$STAGING_PATH" || die "rootfs extraction failed"
     else
-        die "--import: '${IMPORT_SRC}' is neither a directory nor a file"
+        die "--import: '${src}' is neither a directory nor a file"
     fi
 
     [[ -d "${STAGING_PATH}/etc" && -d "${STAGING_PATH}/usr" ]] \
@@ -1001,22 +1037,14 @@ do_import() {
 
     wire_import_tree "$STAGING_PATH"
 
-    local new_ts new_name
-    new_ts="$(date +%Y%m%dT%H%M%S)"
-    new_name="root.${LINEAGE_FLAG}.${new_ts}"
-    info "creating new read-only snapshot: ${SNAP_PATH}/${new_name}"
-    btrfs subvolume snapshot -r "$STAGING_PATH" "${SNAP_PATH}/${new_name}" \
-        || die "failed to create new read-only snapshot"
-    btrfs subvolume delete "$STAGING_PATH" || warn "could not delete staging subvol"
-    info "staging subvolume removed"
-
-    finish_new_lineage "$LINEAGE_FLAG" "$new_name"
+    commit_staging_as "$LINEAGE_FLAG"
+    finish_new_lineage "$LINEAGE_FLAG" "$COMMITTED_NAME"
 }
 
 # ── Dispatch ─────────────────────────────────────────────────────────
 case "$MODE" in
-    switch)  do_switch "$SWITCH_ARG" ;;
-    remove)  do_remove "$REMOVE_ARG" ;;
-    release) do_release ;;
-    import)  do_import ;;
+    switch)  do_switch "$MODE_ARG" ;;
+    remove)  do_remove "$MODE_ARG" ;;
+    release) do_release "$MODE_ARG" ;;
+    import)  do_import "$MODE_ARG" ;;
 esac
