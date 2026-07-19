@@ -8,7 +8,7 @@ Standards-Version: 4.6.2
 Package: freshroot
 Architecture: all
 Depends: btrfs-progs, dracut, systemd-container, ${misc:Depends}
-Recommends: git, btrbk
+Recommends: git, btrbk, distro-info-data
 Conflicts: initramfs-tools
 Description: Freshroot — btrfs snapshot-based immutable root
  Makes a Linux installation effectively immutable by booting from
@@ -17,8 +17,11 @@ Description: Freshroot — btrfs snapshot-based immutable root
  .
  Includes:
   - dracut module for boot-time snapshot cloning
-  - GRUB hook for snapshot-based boot entries
+  - GRUB hook for snapshot-based boot entries, grouped by lineage
   - freshroot-update script for staged apt updates and custom scripts
+  - freshroot-build script for two-tier "from scratch" snapshot builds
+  - freshroot-install script for installing other OS releases as new
+    snapshot lineages (each with its own retention quota)
  .
  The autoinstall bootstrap script (freshroot-setup) ships
  separately and is run from the installation media.
