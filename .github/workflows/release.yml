@@ -11,17 +11,12 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install shellcheck
-        run: sudo apt-get install -y shellcheck
+        run: sudo apt-get install -y shellcheck dpkg-dev
 
+      # make lint keeps the Makefile SCRIPTS variable the single source of
+      # truth for which scripts are checked
       - name: Shellcheck scripts
-        run: |
-          shellcheck -s bash \
-            data/usr/sbin/freshroot-update \
-            installer/freshroot-setup \
-            data/usr/lib/dracut/modules.d/90freshroot/module-setup.sh \
-            data/usr/lib/dracut/modules.d/90freshroot/freshroot-setup.sh \
-            data/usr/lib/dracut/modules.d/90freshroot/freshroot-generator \
-            data/etc/grub.d/06_freshroot
+        run: make lint
 
   build:
     needs: lint
