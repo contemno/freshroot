@@ -1,0 +1,505 @@
+#!/bin/bash
+# /usr/sbin/freshroot-build
+# Immutable root BUILD script (two-tier, "from scratch").
+#
+#   TIER 1  Apply vanilla apt upgrades to the pinned, persistent @base
+#           subvolume (incrementally, in place via an atomic clone+swap).
+#           The REPOS/install.sh component recipe and BIND_MOUNTS are NEVER
+#           applied here.
+#   TIER 2  Clone the freshly-upgraded @base to a writable @staging, apply
+#           ONLY the component recipe (REPOS install.sh), snapshot the result
+#           read-only into @snapshots/root.<TS>, then discard @staging.
+#
+# Because every bootable snapshot is built from a fresh clone of @base, a
+# component removed from REPOS simply never reappears: it never touched @base,
+# so nothing it installed can linger in future snapshots.
+#
+# Boot selection is unchanged: 06_freshroot sorts @snapshots/root.* and boots
+# the newest, so the snapshot produced here boots with no GRUB/initramfs change.
+#
+# NOTE: the helpers resolve_btrfs_device, protect_snapshot_kernels, the bind
+# arrays, the prune block and die/info/warn are intentionally COPIED from
+# /usr/sbin/freshroot-update (the two tools must not share a library per the
+# "edit minimum / new utility alongside" design). If you fix a bug in one, fix
+# the other. See the Sync-Point Checklist in the project plan.
+set -euo pipefail
+
+INIT_BASE=0
+INIT_FROM=""
+INTERACTIVE=0
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --init-base) INIT_BASE=1 ;;
+        --from)
+            [[ $# -ge 2 ]] || { echo "freshroot-build: --from requires an argument" >&2; exit 1; }
+            INIT_FROM="$2"; shift ;;
+        --from=*)    INIT_FROM="${1#--from=}" ;;
+        --shell|-i)  INTERACTIVE=1 ;;
+        -h|--help)
+            cat <<'USAGE'
+Usage: freshroot-build [--init-base [--from <subvol>]] [--shell]
+
+  (no args)        Upgrade @base (vanilla apt) then build a new read-only
+                   snapshot with the REPOS component recipe applied to a fresh
+                   clone of @base. Reboot to apply.
+  --init-base      Create @base on a system that lacks it (existing installs).
+  --from <subvol>  Source subvolume for --init-base (default: @). May name a
+                   snapshot, e.g. --from @snapshots/root.20250101T000000.
+  --shell          Skip the base upgrade; drop an interactive shell on a fresh
+                   clone of @base. Exit 0 to snapshot it, non-zero to abort.
+USAGE
+            exit 0 ;;
+        *) echo "freshroot-build: unknown argument: $1" >&2; exit 1 ;;
+    esac
+    shift
+done
+
+CONF="/etc/freshroot-update.conf"
+if [[ ! -f "$CONF" ]]; then
+    echo "ERROR: config not found at $CONF" >&2
+    exit 1
+fi
+# shellcheck source=/dev/null
+source "$CONF"
+
+# ── Globals ──────────────────────────────────────────────────────────
+TOPLEVEL="/run/freshroot-build/btrfs-toplevel"
+STAMP="root.$(date +%Y%m%dT%H%M%S)"
+# Shared with freshroot-update so build and update are mutually exclusive
+# (both manipulate @staging, the top-level mount and update-grub).
+LOCKFILE="/run/freshroot-update.lock"
+LOG_FILE="${LOG_DIR}/build-${STAMP}.log"
+
+# Defaults in case an older config predates these keys
+BASE_SUBVOL="${BASE_SUBVOL:-@base}"
+BUILD_RUN_CLOUD_INIT="${BUILD_RUN_CLOUD_INIT:-0}"
+
+# ── Helpers ──────────────────────────────────────────────────────────
+die()  { echo "FATAL: $*" | tee -a "$LOG_FILE" >&2; exit 1; }
+info() { echo "[$(date +%H:%M:%S)] $*" | tee -a "$LOG_FILE"; }
+warn() { echo "[$(date +%H:%M:%S)] WARNING: $*" | tee -a "$LOG_FILE" >&2; }
+
+# Bind / unbind the shared /boot (+EFI) partitions into a subvolume tree so
+# kernel installs inside the container land on the real boot partition.
+mount_boot_binds() {
+    local root="$1"
+    mkdir -p "${root}${BOOT_PARTITION}"
+    mount --bind "$BOOT_PARTITION" "${root}${BOOT_PARTITION}" \
+        || die "failed to bind-mount $BOOT_PARTITION"
+    if [[ -n "$EFI_PARTITION" && "$EFI_PARTITION" != "$BOOT_PARTITION" ]]; then
+        mkdir -p "${root}${EFI_PARTITION}"
+        mount --bind "$EFI_PARTITION" "${root}${EFI_PARTITION}" \
+            || die "failed to bind-mount $EFI_PARTITION"
+    fi
+}
+umount_boot_binds() {
+    local root="$1"
+    if [[ -n "$EFI_PARTITION" && "$EFI_PARTITION" != "$BOOT_PARTITION" ]]; then
+        if mountpoint -q "${root}${EFI_PARTITION}" 2>/dev/null; then
+            umount -R "${root}${EFI_PARTITION}" 2>/dev/null || true
+        fi
+    fi
+    if mountpoint -q "${root}${BOOT_PARTITION}" 2>/dev/null; then
+        umount -R "${root}${BOOT_PARTITION}" 2>/dev/null || true
+    fi
+}
+
+cleanup() {
+    local rc=$?
+    # Unmount any boot binds left under the staging or base-work subvolumes,
+    # then the top-level. Paths use config vars so this is safe even if we die
+    # before the *_PATH globals are assigned.
+    umount_boot_binds "${TOPLEVEL}/${STAGING_SUBVOL}"
+    umount_boot_binds "${TOPLEVEL}/${BASE_SUBVOL}.new"
+    if mountpoint -q "$TOPLEVEL" 2>/dev/null; then
+        umount -l "$TOPLEVEL" || true
+    fi
+    rm -f "$LOCKFILE"
+    if [[ $rc -ne 0 ]]; then
+        info "Build FAILED (exit $rc). Any retained @staging/@base.new left for investigation."
+        info "  Inspect via: mount -o subvolid=5 <dev> /mnt && ls /mnt"
+    fi
+    exit $rc
+}
+trap cleanup EXIT
+
+# ── Sanity checks ────────────────────────────────────────────────────
+[[ $(id -u) -eq 0 ]] || die "must be run as root"
+
+# Acquire the shared lock so build/update runs don't collide
+exec 9>"$LOCKFILE"
+if ! flock -n 9; then
+    echo "Another freshroot-build or freshroot-update is already running. Exiting." >&2
+    exit 0
+fi
+
+mkdir -p "$LOG_DIR"
+info "=== freshroot-build started ==="
+
+# ── Resolve the btrfs device backing root ────────────────────────────
+resolve_btrfs_device() {
+    local dev
+    dev=$(findmnt -n -o SOURCE / | head -1)
+    # Strip subvol path if present (e.g. /dev/mapper/crypt[@rootfs])
+    dev="${dev%%\[*}"
+    if [[ -z "$dev" ]]; then
+        die "cannot determine btrfs device for /"
+    fi
+    echo "$dev"
+}
+BTRFS_DEV=$(resolve_btrfs_device)
+info "BTRFS device: $BTRFS_DEV"
+
+# ── Mount top-level btrfs volume ─────────────────────────────────────
+mkdir -p "$TOPLEVEL"
+mount -t btrfs -o subvolid=5 "$BTRFS_DEV" "$TOPLEVEL" || die "failed to mount top-level"
+info "top-level mounted at $TOPLEVEL"
+
+SNAP_PATH="${TOPLEVEL}/${SNAPSHOTS_DIR}"
+STAGING_PATH="${TOPLEVEL}/${STAGING_SUBVOL}"
+BASE_PATH="${TOPLEVEL}/${BASE_SUBVOL}"
+BASE_NEW_PATH="${BASE_PATH}.new"
+BASE_OLD_PATH="${BASE_PATH}.old"
+
+[[ -d "$SNAP_PATH" ]] || die "snapshots directory not found at ${SNAP_PATH}"
+
+# ── Reconcile leftovers from a crashed run ───────────────────────────
+if btrfs subvolume show "$BASE_NEW_PATH" &>/dev/null; then
+    warn "stale ${BASE_SUBVOL}.new found — deleting"
+    btrfs subvolume delete "$BASE_NEW_PATH" || die "cannot delete stale ${BASE_SUBVOL}.new"
+fi
+if ! btrfs subvolume show "$BASE_PATH" &>/dev/null && \
+     btrfs subvolume show "$BASE_OLD_PATH" &>/dev/null; then
+    warn "${BASE_SUBVOL} missing but ${BASE_SUBVOL}.old present — restoring"
+    mv "$BASE_OLD_PATH" "$BASE_PATH" || die "cannot restore ${BASE_SUBVOL} from .old"
+fi
+if btrfs subvolume show "$BASE_OLD_PATH" &>/dev/null; then
+    warn "stale ${BASE_SUBVOL}.old found — deleting"
+    btrfs subvolume delete "$BASE_OLD_PATH" || warn "could not delete stale ${BASE_SUBVOL}.old"
+fi
+
+# ── --init-base: seed @base, then exit ───────────────────────────────
+init_base() {
+    if btrfs subvolume show "$BASE_PATH" &>/dev/null; then
+        die "${BASE_SUBVOL} already exists at ${BASE_PATH} — refusing to overwrite (delete it manually to re-seed)"
+    fi
+    local src="${INIT_FROM:-$ROOT_SUBVOL}"
+    local src_path="${TOPLEVEL}/${src}"
+    btrfs subvolume show "$src_path" &>/dev/null \
+        || die "source subvolume '${src}' not found at ${src_path}"
+    [[ -d "${src_path}/usr/lib/modules" && -x "${src_path}/usr/bin/apt-get" ]] \
+        || die "source '${src}' does not look like a root filesystem"
+    if [[ -z "$INIT_FROM" ]]; then
+        warn "seeding ${BASE_SUBVOL} from ${ROOT_SUBVOL} (@); @ may carry post-install"
+        warn "customizations that would become part of the permanent base."
+        warn "For a guaranteed-clean base, re-run with --from <a pristine snapshot>."
+    fi
+    info "creating writable ${BASE_SUBVOL} from ${src}"
+    btrfs subvolume snapshot "$src_path" "$BASE_PATH" || die "failed to create ${BASE_SUBVOL}"
+    info "${BASE_SUBVOL} created. Run 'freshroot-build' to upgrade it and build a snapshot."
+}
+
+if [[ $INIT_BASE -eq 1 ]]; then
+    init_base
+    info "=== freshroot-build --init-base completed ==="
+    exit 0
+fi
+
+# A normal build requires @base to exist
+btrfs subvolume show "$BASE_PATH" &>/dev/null \
+    || die "${BASE_SUBVOL} not found. Run 'freshroot-build --init-base [--from <subvol>]' first."
+
+# ── Bind-mount flags shared by both tiers ────────────────────────────
+# Persist the apt cache so downloaded .debs survive @staging/@base.new deletion.
+APT_CACHE_BIND=("--bind=${TOPLEVEL}/@apt-cache:/var/cache/apt")
+# Expose the btrfs top-level (subvolid=5) so a component install.sh can manage
+# subvolumes. This exposes ALL subvolumes rw — only list trusted REPOS entries.
+TOPLEVEL_BIND=("--bind=${TOPLEVEL}:/run/freshroot-toplevel")
+
+# Extra binds from BIND_MOUNTS ("HOST:CONTAINER[:ro]") — TIER 2 (components) ONLY.
+EXTRA_BINDS=()
+for _bm in "${BIND_MOUNTS[@]:-}"; do
+    [[ -z "$_bm" ]] && continue
+    _host="${_bm%%:*}"
+    _rest="${_bm#*:}"
+    if [[ "$_rest" == *:ro ]]; then
+        _container="${_rest%:ro}"
+        [[ -e "$_host" ]] || { warn "BIND_MOUNTS: host path missing, skipping: $_host"; continue; }
+        EXTRA_BINDS+=("--bind-ro=${_host}:${_container}")
+        info "bind-mount (ro): $_host -> $_container"
+    else
+        _container="$_rest"
+        [[ -e "$_host" ]] || { warn "BIND_MOUNTS: host path missing, skipping: $_host"; continue; }
+        EXTRA_BINDS+=("--bind=${_host}:${_container}")
+        info "bind-mount (rw): $_host -> $_container"
+    fi
+done
+
+# ── Protect kernels referenced by snapshots / @ / @base ──────────────
+# Scan in-use /usr/lib/modules/ versions, then apt-mark hold the matching
+# packages inside the target chroot so apt full-upgrade / autoremove cannot
+# remove a kernel that a retained snapshot still needs from the shared /boot.
+protect_snapshot_kernels() {
+    local snap_dir="$1" staging="$2"
+    local -A in_use=()
+
+    # Collect kernel versions from all read-only snapshots
+    for snap in "${snap_dir}"/*/; do
+        [[ -d "${snap}usr/lib/modules" ]] || continue
+        for mod_dir in "${snap}usr/lib/modules"/*/; do
+            [[ -d "$mod_dir" ]] || continue
+            local kver
+            kver=$(basename "$mod_dir")
+            in_use["$kver"]=1
+        done
+    done
+
+    # Also protect kernels from the root subvolume (@)
+    if [[ -d "${TOPLEVEL}/${ROOT_SUBVOL}/usr/lib/modules" ]]; then
+        for mod_dir in "${TOPLEVEL}/${ROOT_SUBVOL}/usr/lib/modules"/*/; do
+            [[ -d "$mod_dir" ]] || continue
+            local kver
+            kver=$(basename "$mod_dir")
+            in_use["$kver"]=1
+        done
+    fi
+
+    # Also protect kernels from the pinned base (@base) — its current kernel
+    # must survive the TIER-1 autoremove that runs against @base's package DB.
+    if [[ -d "${TOPLEVEL}/${BASE_SUBVOL}/usr/lib/modules" ]]; then
+        for mod_dir in "${TOPLEVEL}/${BASE_SUBVOL}/usr/lib/modules"/*/; do
+            [[ -d "$mod_dir" ]] || continue
+            local kver
+            kver=$(basename "$mod_dir")
+            in_use["$kver"]=1
+        done
+    fi
+
+    if [[ ${#in_use[@]} -eq 0 ]]; then
+        info "no kernel versions found — skipping hold"
+        return
+    fi
+
+    local hold_pkgs=()
+    for kver in "${!in_use[@]}"; do
+        for prefix in linux-image linux-modules linux-modules-extra; do
+            if chroot "$staging" dpkg -s "${prefix}-${kver}" &>/dev/null; then
+                hold_pkgs+=("${prefix}-${kver}")
+            fi
+        done
+    done
+
+    if [[ ${#hold_pkgs[@]} -gt 0 ]]; then
+        info "holding ${#hold_pkgs[@]} kernel package(s) referenced by snapshots/@/${BASE_SUBVOL}"
+        chroot "$staging" apt-mark hold "${hold_pkgs[@]}" >/dev/null 2>&1 || true
+        for pkg in "${hold_pkgs[@]}"; do
+            info "  held: $pkg"
+        done
+    fi
+}
+
+# Disable nspawn's default seccomp filter (trusted code; apt/git are
+# syscall-heavy and the filter adds measurable overhead).
+export SYSTEMD_SECCOMP=0
+
+# ═══════════════════════════════════════════════════════════════════
+# TIER 1: vanilla apt upgrade of @base (skipped in --shell mode)
+# Upgrade a CoW clone and swap it in atomically so an interrupted run can
+# never leave a half-upgraded @base — the single seed for every build.
+# ═══════════════════════════════════════════════════════════════════
+if [[ $INTERACTIVE -eq 0 ]]; then
+    info "TIER 1: upgrading ${BASE_SUBVOL} (vanilla apt only)"
+    btrfs subvolume snapshot "$BASE_PATH" "$BASE_NEW_PATH" \
+        || die "failed to clone ${BASE_SUBVOL}"
+
+    mount_boot_binds "$BASE_NEW_PATH"
+
+    # Hold snapshot/@/@base kernels before autoremove can touch them
+    protect_snapshot_kernels "$SNAP_PATH" "$BASE_NEW_PATH"
+
+    NSPAWN_RC=0
+    info "entering nspawn container to upgrade ${BASE_SUBVOL}"
+    systemd-nspawn \
+        --directory="$BASE_NEW_PATH" \
+        --resolv-conf=bind-stub \
+        --setenv=DEBIAN_FRONTEND=noninteractive \
+        "${APT_CACHE_BIND[@]}" \
+        "${TOPLEVEL_BIND[@]}" \
+        --quiet \
+        --console=pipe \
+        /bin/bash -e <<'INNER' 2>&1 | tee -a "$LOG_FILE" || NSPAWN_RC=${PIPESTATUS[0]}
+
+# ── Vanilla system updates ONLY — no components, no cloud-init ───────
+apt-get update
+apt-get full-upgrade -y
+apt-get autoremove -y
+
+INNER
+
+    umount_boot_binds "$BASE_NEW_PATH"
+
+    if [[ $NSPAWN_RC -ne 0 ]]; then
+        btrfs subvolume delete "$BASE_NEW_PATH" 2>/dev/null || true
+        die "base upgrade failed (exit $NSPAWN_RC) — ${BASE_SUBVOL} left untouched"
+    fi
+
+    # Atomic swap: @base -> @base.old, @base.new -> @base, delete @base.old
+    info "swapping in the upgraded ${BASE_SUBVOL}"
+    mv "$BASE_PATH" "$BASE_OLD_PATH"   || die "failed to move ${BASE_SUBVOL} aside"
+    mv "$BASE_NEW_PATH" "$BASE_PATH"   || die "failed to promote upgraded ${BASE_SUBVOL}"
+    btrfs subvolume delete "$BASE_OLD_PATH" || warn "could not delete old ${BASE_SUBVOL}.old"
+    info "TIER 1 complete: ${BASE_SUBVOL} upgraded"
+else
+    info "--shell: skipping TIER 1 base upgrade"
+fi
+
+# ═══════════════════════════════════════════════════════════════════
+# TIER 2: component layer from a fresh clone of @base
+# ═══════════════════════════════════════════════════════════════════
+info "TIER 2: building component layer from ${BASE_SUBVOL}"
+
+# Clean any leftover staging subvolume
+if btrfs subvolume show "$STAGING_PATH" &>/dev/null; then
+    warn "stale staging subvolume found — deleting"
+    btrfs subvolume delete "$STAGING_PATH" || die "cannot delete stale staging"
+fi
+
+btrfs subvolume snapshot "$BASE_PATH" "$STAGING_PATH" \
+    || die "failed to create staging snapshot"
+
+mount_boot_binds "$STAGING_PATH"
+
+NSPAWN_RC=0
+if [[ $INTERACTIVE -eq 1 ]]; then
+    info "entering interactive nspawn shell on ${STAGING_SUBVOL} — exit 0 to snapshot, non-zero to abort"
+    systemd-nspawn \
+        --directory="$STAGING_PATH" \
+        --resolv-conf=bind-stub \
+        --setenv=DEBIAN_FRONTEND=noninteractive \
+        --console=interactive \
+        "${APT_CACHE_BIND[@]}" \
+        "${TOPLEVEL_BIND[@]}" \
+        "${EXTRA_BINDS[@]}" \
+        /bin/bash --norc --noprofile -c 'set +u; exec bash -l' || NSPAWN_RC=$?
+else
+    # Serialize REPOS array for passing into nspawn
+    REPOS_JOINED=""
+    for _repo in "${REPOS[@]:-}"; do
+        [[ -n "$_repo" ]] && REPOS_JOINED+="${_repo}"$'\n'
+    done
+
+    info "entering nspawn container for the component layer"
+    systemd-nspawn \
+        --directory="$STAGING_PATH" \
+        --resolv-conf=bind-stub \
+        --setenv=DEBIAN_FRONTEND=noninteractive \
+        --setenv=_FRESHROOT_REPOS="$REPOS_JOINED" \
+        --setenv=_FRESHROOT_CLOUD_INIT="$BUILD_RUN_CLOUD_INIT" \
+        "${APT_CACHE_BIND[@]}" \
+        "${TOPLEVEL_BIND[@]}" \
+        "${EXTRA_BINDS[@]}" \
+        --quiet \
+        --console=pipe \
+        /bin/bash -e <<'INNER' 2>&1 | tee -a "$LOG_FILE" || NSPAWN_RC=${PIPESTATUS[0]}
+
+# ── Refresh package lists so a component install.sh can install packages ──
+# (No full-upgrade/autoremove here — vanilla apt is TIER 1's job, on @base.)
+apt-get update
+
+# ── Cloud-init provisioning (opt-in via BUILD_RUN_CLOUD_INIT) ───────
+if [[ "${_FRESHROOT_CLOUD_INIT:-0}" == "1" ]]; then
+    echo "==> Running cloud-init provisioning"
+    cloud-init init --local
+    cloud-init init
+    cloud-init modules --mode=config
+    cloud-init modules --mode=final
+    # Remove first-boot service so it doesn't run again from the new snapshot
+    rm -f /etc/systemd/system/freshroot-provision.service
+    rm -f /etc/systemd/system/multi-user.target.wants/freshroot-provision.service
+fi
+
+# ── Run component scripts (REPOS) ───────────────────────────────────
+while IFS= read -r repo; do
+    [[ -z "$repo" ]] && continue
+    if [[ "$repo" == local://* ]]; then
+        # Local path (typically a bind-mounted dir): run install.sh in place
+        path="${repo#local://}"
+        if [[ ! -d "$path" ]]; then
+            echo "WARNING: local path not found: $path — skipping" >&2
+            continue
+        fi
+        if [[ -x "$path/install.sh" ]]; then
+            echo "==> Running install.sh from $path (local)"
+            (cd "$path" && ./install.sh)
+        else
+            echo "WARNING: no executable install.sh in $path — skipping" >&2
+        fi
+    else
+        echo "==> Cloning $repo"
+        work=$(mktemp -d /tmp/freshroot-repo.XXXXXX)
+        git clone --depth=1 "$repo" "$work"
+        if [[ -x "$work/install.sh" ]]; then
+            echo "==> Running install.sh from $repo"
+            (cd "$work" && ./install.sh)
+        else
+            echo "WARNING: no executable install.sh in $repo — skipping" >&2
+        fi
+        rm -rf "$work"
+    fi
+done <<< "${_FRESHROOT_REPOS:-}"
+
+INNER
+fi
+
+# Unmount boot/EFI before snapshotting
+umount_boot_binds "$STAGING_PATH"
+
+if [[ $NSPAWN_RC -ne 0 ]]; then
+    die "component build failed (exit $NSPAWN_RC) — staging retained at ${STAGING_SUBVOL}"
+fi
+
+# ── Create new read-only snapshot from the component layer ───────────
+NEW_SNAP="${SNAP_PATH}/${STAMP}"
+info "creating new read-only snapshot: $NEW_SNAP"
+btrfs subvolume snapshot -r "$STAGING_PATH" "$NEW_SNAP" \
+    || die "failed to create new read-only snapshot"
+
+btrfs subvolume delete "$STAGING_PATH" || warn "could not delete staging subvol"
+info "staging subvolume removed"
+
+# ── Prune old snapshots ─────────────────────────────────────────────
+if [[ "${MAX_SNAPSHOTS:-0}" -gt 0 ]]; then
+    # Determine which snapshot we booted from so we don't prune it
+    BOOTED_SNAP=""
+    BOOTED_SUBVOL=$(grep -o 'subvol=@snapshots/[^ ,]*' /proc/cmdline 2>/dev/null | head -1 | sed 's|subvol=@snapshots/||') || true
+    if [[ -n "$BOOTED_SUBVOL" ]]; then
+        BOOTED_SNAP="${SNAP_PATH}/${BOOTED_SUBVOL}"
+    fi
+
+    mapfile -t ALL_SNAPS < <(
+        for d in "${SNAP_PATH}"/*/; do
+            [[ -d "$d" ]] && btrfs property get "$d" ro 2>/dev/null | grep -q 'ro=true' && echo "$d"
+        done | sort
+    )
+    EXCESS=$(( ${#ALL_SNAPS[@]} - MAX_SNAPSHOTS ))
+    if [[ $EXCESS -gt 0 ]]; then
+        info "pruning $EXCESS old snapshot(s)"
+        for (( i=0; i<EXCESS; i++ )); do
+            snap="${ALL_SNAPS[$i]%/}"
+            # Don't delete the snapshot we booted from
+            if [[ "$snap" = "$BOOTED_SNAP" ]]; then
+                info "  skipping (currently booted): $snap"
+                continue
+            fi
+            info "  deleting: $snap"
+            btrfs subvolume delete "$snap" || warn "failed to prune $snap"
+        done
+    fi
+fi
+
+# ── Update GRUB to pick up the new snapshot ──────────────────────────
+info "regenerating GRUB configuration"
+update-grub 2>&1 | tee -a "$LOG_FILE" || warn "update-grub failed"
+
+info "=== freshroot-build completed successfully ==="
+info "New snapshot ${STAMP} is ready. Reboot to apply."

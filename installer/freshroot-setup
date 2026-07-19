@@ -198,7 +198,7 @@ for item in /target/*; do
     case "$base" in
         @|@home|@snapshots|@log|@apt-cache|@tmp|@spool|@crash|\
         @containers|@flatpak|@snap|@libvirt|@AccountsService|\
-        @gdm3|@bluetooth|@cups|@fwupd|@netmanager|@machine-id|@swap)
+        @gdm3|@bluetooth|@cups|@fwupd|@netmanager|@machine-id|@swap|@base)
             continue ;;
         *)
             if mountpoint -q "$item" 2>/dev/null; then
@@ -255,6 +255,12 @@ fi
 info "Phase 9: Creating baseline snapshot"
 TIMESTAMP=$(date +%Y%m%dT%H%M%S)
 btrfs subvolume snapshot -r /target/@ "/target/@snapshots/root.$TIMESTAMP"
+
+# Pinned vanilla base for two-tier builds (freshroot-build). Writable, a sibling
+# of @, NOT under @snapshots and NOT named root.* — so GRUB and snapshot pruning
+# ignore it. @ here is the clean install (no components run until update/build
+# time), which is exactly the base we want to clone for every future build.
+btrfs subvolume snapshot /target/@ /target/@base
 
 btrfs subvolume list /target | while read -r line; do
     info "  $line"

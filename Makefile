@@ -5,6 +5,7 @@ DEB      := target/$(PACKAGE)_$(VERSION)_all.deb
 SETUP    := target/freshroot-setup
 
 SCRIPTS  := data/usr/sbin/freshroot-update \
+            data/usr/sbin/freshroot-build \
             installer/freshroot-setup \
             data/usr/lib/dracut/modules.d/90freshroot/module-setup.sh \
             data/usr/lib/dracut/modules.d/90freshroot/freshroot-setup.sh \
