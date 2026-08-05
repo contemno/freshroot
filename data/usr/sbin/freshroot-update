@@ -69,6 +69,7 @@ TS="$(date +%Y%m%dT%H%M%S)"
 LOCKFILE="/run/freshroot-update.lock"
 LOG_FILE="${LOG_DIR}/update-${TS}.log"
 DEFAULT_LINEAGE_FILE="/boot/freshroot/default-lineage"
+BOOT_ARCHIVE="${BOOT_PARTITION:-/boot}/freshroot"
 
 # ── Helpers ──────────────────────────────────────────────────────────
 die()  { echo "FATAL: $*" | tee -a "$LOG_FILE" >&2; exit 1; }
@@ -278,9 +279,183 @@ prune_snapshots() {
                 continue
             fi
             info "  deleting: $snap"
-            btrfs subvolume delete "$snap" || warn "failed to prune $snap"
+            if btrfs subvolume delete "$snap"; then
+                rm -rf "${BOOT_ARCHIVE:?}/${snap##*/}"
+            else
+                warn "failed to prune $snap"
+            fi
         done
     done
+    prune_boot_archive
+}
+
+# ── /boot kernel archive ─────────────────────────────────────────────
+# Every committed snapshot gets ${BOOT_ARCHIVE}/<name>/ holding hardlinks
+# to the flat /boot kernel pair(s) its tree can boot, frozen at commit
+# time. apt may later unlink the flat names (autoremove); the archived
+# links keep the inodes alive, so no snapshot loses its kernel.
+# 06_freshroot points GRUB entries into the archive and falls back to the
+# flat names for unarchived trees. The mutable trees (@, @base) get their
+# archives refreshed on every run instead of frozen. /boot is ext4:
+# hardlinks are free and identical content shares one inode, so the
+# archive costs space only where initrds actually diverged.
+# SYNC: this corpus is copied between freshroot-update, freshroot-build
+# and freshroot-install; 06_freshroot reads (never writes) the archive
+# layout, and installer/freshroot-setup Phase 10 seeds the baseline
+# snapshot's archive inline. Fix every copy together.
+
+# Hardlink src into dstdir. Falls back to a copy when linking fails (an
+# imported tree's own /boot lives on btrfs, across filesystems). No-op
+# when the destination already is the same inode.
+_archive_link() {
+    local src="$1" dstdir="$2" dst
+    dst="${dstdir}/${src##*/}"
+    [[ -f "$src" ]] || return 1
+    [[ -e "$dst" && "$dst" -ef "$src" ]] && return 0
+    rm -f "${dst}.tmp"
+    if ! ln "$src" "${dst}.tmp" 2>/dev/null; then
+        cp -p "$src" "${dst}.tmp" || { rm -f "${dst}.tmp"; return 1; }
+    fi
+    mv -f "${dst}.tmp" "$dst"
+}
+
+# Archive the kernel pair(s) a tree can boot into ${BOOT_ARCHIVE}/<name>/:
+# for each kver in the tree's /usr/lib/modules, the vmlinuz and initrd are
+# taken from flat /boot, else from the tree's own /boot (imported rootfs).
+# Missing pairs warn instead of failing (06_freshroot skips such kernels
+# the same way).
+archive_boot_kernels() {
+    local tree="$1" name="$2"
+    local dir="${BOOT_ARCHIVE}/${name}" mod_dir kver src vml initrd f pct
+    [[ -d "${tree}/usr/lib/modules" ]] || return 0
+    mkdir -p "$dir"
+    for mod_dir in "${tree}/usr/lib/modules"/*/; do
+        [[ -d "$mod_dir" ]] || continue
+        kver=$(basename "$mod_dir")
+        vml=""
+        for src in "$BOOT_PARTITION" "${tree}/boot"; do
+            [[ -f "${src}/vmlinuz-${kver}" ]] && { vml="${src}/vmlinuz-${kver}"; break; }
+        done
+        if [[ -z "$vml" ]]; then
+            warn "archive ${name}: no vmlinuz-${kver} in ${BOOT_PARTITION} — skipping ${kver}"
+            continue
+        fi
+        initrd=""
+        for f in "initrd.img-${kver}" "initramfs-${kver}.img"; do
+            for src in "$BOOT_PARTITION" "${tree}/boot"; do
+                [[ -f "${src}/${f}" ]] && { initrd="${src}/${f}"; break 2; }
+            done
+        done
+        if [[ -z "$initrd" ]]; then
+            warn "archive ${name}: no initrd for ${kver} — skipping ${kver}"
+            continue
+        fi
+        _archive_link "$vml" "$dir" || { warn "archive ${name}: failed to link ${vml}"; continue; }
+        _archive_link "$initrd" "$dir" || warn "archive ${name}: failed to link ${initrd}"
+    done
+    pct=$(df --output=pcent "$BOOT_PARTITION" 2>/dev/null | tail -1 | tr -cd '0-9') || pct=""
+    if [[ -n "$pct" && "$pct" -ge 90 ]]; then
+        warn "${BOOT_PARTITION} is ${pct}% full — lower snapshot quotas or remove lineages to free kernel archives"
+    fi
+}
+
+# Refresh the archive of a MUTABLE tree (@, @base): its bootable set
+# changes between runs, so clear and re-link instead of freezing.
+refresh_boot_archive() {
+    local tree="$1" name="$2"
+    [[ -d "${tree}/usr/lib/modules" ]] || return 0
+    mkdir -p "${BOOT_ARCHIVE}/${name}"
+    find "${BOOT_ARCHIVE}/${name}" -maxdepth 1 -type f -delete
+    archive_boot_kernels "$tree" "$name"
+}
+
+# Re-link kernels from an archive back into flat /boot when missing there:
+# a staging clone of an older tree must see its kernel pair under the flat
+# names (kernel postinsts and the flat-first archive lookups read them).
+restore_boot_from_archive() {
+    local aname="$1" staging="$2"
+    local adir="${BOOT_ARCHIVE}/${aname}" mod_dir kver f
+    [[ -d "$adir" ]] || return 0
+    for mod_dir in "${staging}/usr/lib/modules"/*/; do
+        [[ -d "$mod_dir" ]] || continue
+        kver=$(basename "$mod_dir")
+        [[ -f "${adir}/vmlinuz-${kver}" ]] || continue
+        if [[ ! -f "${BOOT_PARTITION}/vmlinuz-${kver}" ]]; then
+            info "restoring vmlinuz-${kver} to ${BOOT_PARTITION} from archive ${aname}"
+            _archive_link "${adir}/vmlinuz-${kver}" "$BOOT_PARTITION" \
+                || warn "failed to restore vmlinuz-${kver}"
+        fi
+        for f in "initrd.img-${kver}" "initramfs-${kver}.img"; do
+            if [[ -f "${adir}/${f}" && ! -f "${BOOT_PARTITION}/${f}" ]]; then
+                _archive_link "${adir}/${f}" "$BOOT_PARTITION" \
+                    || warn "failed to restore ${f}"
+            fi
+        done
+    done
+}
+
+# Backfill archives for snapshots that predate the archive scheme (the
+# retired apt-hold scheme kept their kernels in flat /boot, so the pairs
+# are still there to link), then refresh the mutable trees' archives.
+sync_boot_archives() {
+    local d name
+    for d in "${SNAP_PATH}"/root.*/; do
+        [[ -d "$d" ]] || continue
+        btrfs property get "${d%/}" ro 2>/dev/null | grep -q 'ro=true' || continue
+        name="${d%/}"; name="${name##*/}"
+        [[ -d "${BOOT_ARCHIVE}/${name}" ]] || archive_boot_kernels "${d%/}" "$name"
+    done
+    refresh_boot_archive "${TOPLEVEL}/${ROOT_SUBVOL}" "${ROOT_SUBVOL}"
+    refresh_boot_archive "${TOPLEVEL}/${BASE_SUBVOL}" "${BASE_SUBVOL}"
+}
+
+# GC: remove archive dirs whose snapshot no longer exists (crash between
+# subvolume delete and archive removal, out-of-band snapshot deletion).
+# Only root.* names are candidates — default-lineage and the mutable
+# trees' archives are never touched.
+prune_boot_archive() {
+    local d name
+    for d in "${BOOT_ARCHIVE}"/root.*/; do
+        [[ -d "$d" ]] || continue
+        name="${d%/}"; name="${name##*/}"
+        if [[ ! -d "${SNAP_PATH}/${name}" ]]; then
+            info "removing orphaned kernel archive: ${name}"
+            rm -rf "${d%/}"
+        fi
+    done
+}
+
+# Merge byte-identical files across archive dirs (separate dracut runs can
+# emit identical initrds as separate inodes). util-linux hardlink; no-op
+# when absent.
+dedupe_boot_archive() {
+    command -v hardlink >/dev/null 2>&1 || return 0
+    hardlink -q "$BOOT_ARCHIVE" >/dev/null 2>&1 || true
+}
+
+# Migration shim: release kernel holds planted by the retired
+# protect_snapshot_kernels scheme — snapshots keep their kernels via the
+# archive now, and lingering holds would pin old kernel packages inside
+# every new snapshot. Same name filter as the old code: only versioned
+# kernel packages are touched, admin holds on meta/vendor names survive.
+release_legacy_kernel_holds() {
+    local staging="$1" held pkg kv
+    local -a unhold_pkgs=()
+    held=$(chroot "$staging" apt-mark showhold 2>/dev/null \
+           | grep -E '^(linux-image|linux-modules|linux-modules-extra)-' || true)
+    while IFS= read -r pkg; do
+        [[ -z "$pkg" ]] && continue
+        kv="$pkg"
+        kv="${kv#linux-image-}"
+        kv="${kv#linux-modules-extra-}"
+        kv="${kv#linux-modules-}"
+        [[ "$kv" =~ ^[0-9]+\.[0-9]+ ]] || continue
+        unhold_pkgs+=("$pkg")
+    done <<< "$held"
+    if [[ ${#unhold_pkgs[@]} -gt 0 ]]; then
+        info "releasing ${#unhold_pkgs[@]} legacy kernel hold(s)"
+        chroot "$staging" apt-mark unhold "${unhold_pkgs[@]}" >/dev/null 2>&1 || true
+    fi
 }
 
 # ── Suppress update-grub inside the staging tree ─────────────────────
@@ -350,6 +525,11 @@ STAGING_PATH="${TOPLEVEL}/${STAGING_SUBVOL}"
 if [[ ! -d "$SNAP_PATH" ]]; then
     die "snapshots directory not found at ${SNAP_PATH}"
 fi
+
+# Backfill/refresh the /boot kernel archives before anything can touch the
+# flat names (the legacy-hold release below unpins kernels that only the
+# archive protects from autoremove).
+sync_boot_archives
 
 # ── Determine the lineage to operate on ──────────────────────────────
 CUR_LINEAGE=$(current_lineage)
@@ -436,6 +616,11 @@ if [[ -n "$EFI_PARTITION" && "$EFI_PARTITION" != "$BOOT_PARTITION" ]]; then
         || die "failed to bind-mount $EFI_PARTITION"
 fi
 
+# An older source tree's kernels may have left flat /boot (autoremoved
+# after later snapshots dropped them) — re-link them from its archive so
+# kernel postinsts and the commit-time archive see the flat names.
+restore_boot_from_archive "${LATEST##*/}" "$STAGING_PATH"
+
 # ── Persist the apt cache across updates ─────────────────────────────
 # Bind the @apt-cache subvolume into the container so downloaded .debs
 # aren't discarded when @staging is deleted.
@@ -471,100 +656,12 @@ for _bm in "${BIND_MOUNTS[@]:-}"; do
     fi
 done
 
-# ── Protect kernels referenced by existing snapshots ─────────────────
-# Scan all snapshots' /usr/lib/modules/ to find kernel versions in use,
-# then apt-mark hold the corresponding packages inside the staging
-# subvolume so that apt full-upgrade / autoremove cannot remove them.
-# Holds are convergent: holds for kernels no longer referenced by any
-# snapshot (or @) are released first, so pruned lineages free their
-# kernels for autoremove instead of pinning /boot forever.
-protect_snapshot_kernels() {
-    local snap_dir="$1" staging="$2"
-    local -A in_use=()
-
-    # Collect kernel versions from all read-only snapshots
-    for snap in "${snap_dir}"/*/; do
-        [[ -d "${snap}usr/lib/modules" ]] || continue
-        for mod_dir in "${snap}usr/lib/modules"/*/; do
-            [[ -d "$mod_dir" ]] || continue
-            local kver
-            kver=$(basename "$mod_dir")
-            in_use["$kver"]=1
-        done
-    done
-
-    # Also protect kernels from the root subvolume (@)
-    if [[ -d "${TOPLEVEL}/${ROOT_SUBVOL}/usr/lib/modules" ]]; then
-        for mod_dir in "${TOPLEVEL}/${ROOT_SUBVOL}/usr/lib/modules"/*/; do
-            [[ -d "$mod_dir" ]] || continue
-            local kver
-            kver=$(basename "$mod_dir")
-            in_use["$kver"]=1
-        done
-    fi
-
-    # Also protect kernels from the pinned base (@base), if present — the
-    # convergent hold-release below must never see @base's kernel as
-    # unreferenced, or autoremove could take it from the shared /boot.
-    if [[ -d "${TOPLEVEL}/${BASE_SUBVOL}/usr/lib/modules" ]]; then
-        for mod_dir in "${TOPLEVEL}/${BASE_SUBVOL}/usr/lib/modules"/*/; do
-            [[ -d "$mod_dir" ]] || continue
-            local kver
-            kver=$(basename "$mod_dir")
-            in_use["$kver"]=1
-        done
-    fi
-
-    # Release stale holds (kernel packages whose version is now unreferenced).
-    # Only packages whose stripped remainder LOOKS like a kernel version are
-    # candidates — meta/unsigned/vendor names (linux-image-generic,
-    # linux-image-unsigned-<kver>, linux-modules-nvidia-*) were never held by
-    # this tool and admin holds on them must survive.
-    local held unhold_pkgs=()
-    held=$(chroot "$staging" apt-mark showhold 2>/dev/null \
-           | grep -E '^(linux-image|linux-modules|linux-modules-extra)-' || true)
-    while IFS= read -r pkg; do
-        [[ -z "$pkg" ]] && continue
-        local kv="$pkg"
-        kv="${kv#linux-image-}"
-        kv="${kv#linux-modules-extra-}"
-        kv="${kv#linux-modules-}"
-        [[ "$kv" =~ ^[0-9]+\.[0-9]+ ]] || continue
-        if [[ -z "${in_use[$kv]:-}" ]]; then
-            unhold_pkgs+=("$pkg")
-        fi
-    done <<< "$held"
-    if [[ ${#unhold_pkgs[@]} -gt 0 ]]; then
-        info "releasing ${#unhold_pkgs[@]} stale kernel hold(s)"
-        chroot "$staging" apt-mark unhold "${unhold_pkgs[@]}" >/dev/null 2>&1 || true
-    fi
-
-    if [[ ${#in_use[@]} -eq 0 ]]; then
-        info "no kernel versions found in snapshots — skipping hold"
-        return
-    fi
-
-    # Build the list of packages to hold inside the staging chroot
-    local hold_pkgs=()
-    for kver in "${!in_use[@]}"; do
-        for prefix in linux-image linux-modules linux-modules-extra; do
-            # Only hold if the package is actually installed in staging
-            if chroot "$staging" dpkg -s "${prefix}-${kver}" &>/dev/null; then
-                hold_pkgs+=("${prefix}-${kver}")
-            fi
-        done
-    done
-
-    if [[ ${#hold_pkgs[@]} -gt 0 ]]; then
-        info "holding ${#hold_pkgs[@]} kernel package(s) referenced by snapshots/@/${BASE_SUBVOL}"
-        chroot "$staging" apt-mark hold "${hold_pkgs[@]}" >/dev/null 2>&1 || true
-        for pkg in "${hold_pkgs[@]}"; do
-            info "  held: $pkg"
-        done
-    fi
-}
-
-protect_snapshot_kernels "$SNAP_PATH" "$STAGING_PATH"
+# Kernels referenced by other snapshots need no apt-mark protection any
+# more — each snapshot's ${BOOT_ARCHIVE} dir keeps its kernel inodes alive
+# regardless of what apt unlinks from the flat names. Release the holds the
+# retired scheme left behind so they stop pinning old kernel packages
+# inside every new snapshot.
+release_legacy_kernel_holds "$STAGING_PATH"
 
 # ── Run updates inside nspawn container ──────────────────────────────
 # Disable nspawn's default seccomp filter. Network-heavy workloads
@@ -748,6 +845,10 @@ NEW_SNAP="${SNAP_PATH}/${NEW_NAME}"
 info "creating new read-only snapshot: $NEW_SNAP"
 btrfs subvolume snapshot -r "$STAGING_PATH" "$NEW_SNAP" \
     || die "failed to create new read-only snapshot"
+
+# Freeze the new snapshot's kernel pair(s) into its /boot archive
+archive_boot_kernels "$NEW_SNAP" "$NEW_NAME"
+dedupe_boot_archive
 
 # Delete the staging subvolume
 btrfs subvolume delete "$STAGING_PATH" || warn "could not delete staging subvol"
