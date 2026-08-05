@@ -2,29 +2,47 @@
 # /etc/grub.d/06_freshroot
 #
 # Runs under bash (not sh) so it can source /etc/freshroot-update.conf,
-# which uses bash array syntax for REPOS and BIND_MOUNTS.
+# which uses bash array syntax for REPOS, BIND_MOUNTS and LINEAGE_QUOTAS.
 #
-# Generates GRUB menu entries for the freshroot boot model:
+# Generates GRUB menu entries for the freshroot boot model. Snapshots are
+# grouped into LINEAGES (install lines: root.<lineage>.<TS>, or legacy
+# root.<TS> resolved via the snapshot's os-release):
 #
-#   1. "Freshroot (clean)" — DEFAULT
-#      Boots from the latest btrfs snapshot with the newest compatible
-#      kernel. The initramfs creates a writable clone (@rootfs) from
-#      the snapshot, discarding drift since the last update.
+#   1. "<label> (clean — <lineage> — <ts>)" — DEFAULT
+#      The default lineage's newest snapshot with a bootable kernel pair.
+#      The default lineage is read from /boot/freshroot/default-lineage
+#      (written by freshroot-install --switch), falling back to the running
+#      system's lineage — so installing another release never silently
+#      changes what boots.
 #
-#   2. "Freshroot (tainted)"
-#      Boots from @ directly, with the staging service masked.
+#   2. One clean entry per remaining lineage, newest snapshot first.
 #
-#   3. Per-snapshot submenus
-#      One submenu per snapshot, each containing one entry per kernel
-#      that has modules installed in that snapshot.
+#   3. "<label> (tainted)" — boots @ directly with staging masked. If the
+#      default lineage has no snapshots at all, or none with a bootable
+#      kernel pair, this entry is emitted FIRST (another lineage is never
+#      promoted into the default slot).
 #
-# Each entry is paired only with kernels whose modules exist inside
-# the target root, preventing kernel panics from missing modules.
+#   4. Per-lineage snapshot-history submenus.
+#
+# Snapshots whose tree carries no freshroot boot-ceremony support (marker
+# /usr/lib/freshroot/ceremony or the 90freshroot dracut module) get entries
+# WITHOUT rd.freshroot, labeled "NO CEREMONY" — selecting one boots the
+# read-only snapshot directly. A snapshot may ship /etc/freshroot/cmdline
+# (single line) to replace the auto-generated rd.luks.* parameters.
+#
+# Each entry is paired only with kernels whose modules exist inside the
+# target root, preventing kernel panics from missing modules. Initrds are
+# looked up as /boot/initrd.img-<kver> or /boot/initramfs-<kver>.img.
+#
+# This script runs under plain `set -e` (no -u/pipefail) inside
+# grub-mkconfig and kernel postinsts — keep per-snapshot lookups ||-guarded.
 
 set -e
 
 # --- Configuration ---
 EDITION=""
+SNAPSHOTS_DIR="@snapshots"
+ROOT_SUBVOL="@"
 # shellcheck source=/dev/null
 [ -r /etc/freshroot-update.conf ] && . /etc/freshroot-update.conf
 
@@ -38,6 +56,8 @@ else
 fi
 
 SNAPSHOT_DIR="/.snapshots"
+DEFAULT_LINEAGE_FILE="/boot/freshroot/default-lineage"
+TAB=$(printf '\t')
 BTRFS_DEVICE=$(findmnt -n -o SOURCE / | sed 's/\[.*\]//')
 BTRFS_UUID=$(findmnt -n -o UUID /)
 BOOT_UUID=$(findmnt -n -o UUID /boot)
@@ -52,14 +72,104 @@ if [ -n "$DM_NAME" ]; then
     fi
 fi
 
-# Build the base kernel command line.
+# Base kernel command line, and the dracut LUKS parameters (kept separate:
+# a snapshot's /etc/freshroot/cmdline replaces the LUKS part per entry).
 BASE_CMDLINE="${GRUB_CMDLINE_LINUX:-}"
-
-# Add dracut LUKS parameters if encrypted
+LUKS_CMDLINE=""
 if [ -n "$CRYPT_UUID" ]; then
     echo "$BASE_CMDLINE" | grep -q "rd.luks.uuid=" || \
-        BASE_CMDLINE="rd.luks.uuid=${CRYPT_UUID} rd.luks.name=${CRYPT_UUID}=${DM_NAME} ${BASE_CMDLINE}"
+        LUKS_CMDLINE="rd.luks.uuid=${CRYPT_UUID} rd.luks.name=${CRYPT_UUID}=${DM_NAME}"
 fi
+
+# --- Lineage helpers ---
+# SYNC (partial copy: snap_ts, snap_label, lineage_of_root, snapshot_lineage):
+# the canonical versions live in freshroot-update / freshroot-build /
+# freshroot-install; installer/freshroot-setup Phase 9 re-derives the lineage
+# with the same parsing rules. This copy is bash but runs without set -u or
+# pipefail — keep every per-snapshot lookup ||-guarded. Fix every copy
+# together.
+
+# Timestamp field of a snapshot name; empty if the name has none.
+snap_ts() {
+    _n="${1##*/}"; _n="${_n#root.}"; _last="${_n##*.}"
+    if [[ "$_last" =~ ^[0-9]{8}T[0-9]{6}$ ]]; then
+        printf '%s\n' "$_last"
+    fi
+}
+
+# Lineage label encoded in a snapshot name; empty for legacy names.
+snap_label() {
+    _n="${1##*/}"; _n="${_n#root.}"; _last="${_n##*.}"
+    if [[ "$_last" =~ ^[0-9]{8}T[0-9]{6}$ ]] && [ "${_n#*.}" != "$_n" ]; then
+        printf '%s\n' "${_n%.*}"
+    fi
+}
+
+# Default lineage of a root tree from its os-release (never sourced; the
+# usr/lib copy is preferred and absolute /etc symlinks are re-rooted into
+# the tree). Echoes "unknown" when unreadable.
+lineage_of_root() {
+    _root="$1"; _f=""; _id=""; _ver=""
+    if [ -r "${_root}/usr/lib/os-release" ] && [ ! -L "${_root}/usr/lib/os-release" ]; then
+        _f="${_root}/usr/lib/os-release"
+    elif [ -L "${_root}/etc/os-release" ]; then
+        _tgt=$(readlink "${_root}/etc/os-release" 2>/dev/null) || _tgt=""
+        case "$_tgt" in
+            /*) [ -r "${_root}${_tgt}" ] && _f="${_root}${_tgt}" ;;
+            *)  [ -r "${_root}/etc/os-release" ] && _f="${_root}/etc/os-release" ;;
+        esac
+    elif [ -r "${_root}/etc/os-release" ]; then
+        _f="${_root}/etc/os-release"
+    fi
+    if [ -n "$_f" ]; then
+        _id=$(sed -n 's/^ID=//p' "$_f" 2>/dev/null | head -1 | tr -d '"' \
+              | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9._-') || _id=""
+        _ver=$(sed -n 's/^VERSION_ID=//p' "$_f" 2>/dev/null | head -1 | tr -d '"' \
+               | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9._-') || _ver=""
+    fi
+    if [ -n "$_id" ] && [ -n "$_ver" ]; then
+        printf '%s-%s\n' "$_id" "$_ver"
+    elif [ -n "$_id" ]; then
+        printf '%s\n' "$_id"
+    else
+        printf 'unknown\n'
+    fi
+}
+
+# Lineage of an existing snapshot: the name label, else the tree's os-release.
+snapshot_lineage() {
+    _lbl=$(snap_label "$1")
+    if [ -n "$_lbl" ]; then
+        printf '%s\n' "$_lbl"
+    else
+        lineage_of_root "$1"
+    fi
+}
+
+# Does the tree implement the freshroot boot ceremony?
+ceremony_capable() {
+    [ -f "$1/usr/lib/freshroot/ceremony" ] && return 0
+    [ -f "$1/usr/lib/dracut/modules.d/90freshroot/freshroot-setup.sh" ] && return 0
+    return 1
+}
+
+# Optional per-lineage cmdline snippet (replaces the rd.luks.* parameters).
+lineage_cmdline() {
+    if [ -r "$1/etc/freshroot/cmdline" ]; then
+        head -1 "$1/etc/freshroot/cmdline" 2>/dev/null || true
+    fi
+}
+
+# Human-readable timestamp for a snapshot name.
+display_ts() {
+    _t=$(snap_ts "$1")
+    if [[ "$_t" =~ ^(....)(..)(..)T(..)(..)(..)$ ]]; then
+        printf '%s-%s-%s %s:%s:%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" \
+            "${BASH_REMATCH[3]}" "${BASH_REMATCH[4]}" "${BASH_REMATCH[5]}" "${BASH_REMATCH[6]}"
+    else
+        printf '%s\n' "$1"
+    fi
+}
 
 # --- Collect all kernels available in /boot, newest first ---
 ALL_BOOT_KERNELS=$(for f in /boot/vmlinuz-*; do [ -e "$f" ] && echo "${f##*/vmlinuz-}"; done | sort -rV)
@@ -69,6 +179,18 @@ if [ -z "$ALL_BOOT_KERNELS" ]; then
     exit 0
 fi
 
+# --- Initrd lookup: Debian/Ubuntu naming first, then Fedora-style ---
+# Resolved once per run (initrd presence per kver is invariant) so the
+# per-snapshot kernel scans below stay fork-free.
+declare -A INITRD_PATH=()
+for _krel in $ALL_BOOT_KERNELS; do
+    if [ -f "/boot/initrd.img-${_krel}" ]; then
+        INITRD_PATH[$_krel]="/initrd.img-${_krel}"
+    elif [ -f "/boot/initramfs-${_krel}.img" ]; then
+        INITRD_PATH[$_krel]="/initramfs-${_krel}.img"
+    fi
+done
+
 # --- Find kernels compatible with a given root path ---
 # Returns matching kernel versions (newest first) on stdout.
 # A kernel is compatible if its modules dir exists inside the root
@@ -77,7 +199,7 @@ kernels_for() {
     _root="$1"
     for _krel in $ALL_BOOT_KERNELS; do
         if [ -d "${_root}/usr/lib/modules/${_krel}" ] && \
-           [ -f "/boot/initrd.img-${_krel}" ]; then
+           [ -n "${INITRD_PATH[$_krel]-}" ]; then
             echo "$_krel"
         fi
     done
@@ -92,7 +214,7 @@ best_kernel_for() {
     fi
     BK_REL="$_krel"
     BK_VMLINUZ="/vmlinuz-${_krel}"
-    BK_INITRD="/initrd.img-${_krel}"
+    BK_INITRD="${INITRD_PATH[$_krel]-}"
     return 0
 }
 
@@ -101,18 +223,36 @@ best_kernel_for() {
 emit_entry() {
     _title="$1"
     _subvol="$2"
-    _freshroot="$3"     # "yes" to add rd.freshroot
-    _extra="$4"         # additional kernel params
+    _tree="$3"          # tree path for the cmdline snippet ('' = none)
+    _freshroot="$4"     # "yes" to add rd.freshroot=1
+    _extra="$5"         # additional kernel params
 
-    _rootflags="subvol=${_subvol}"
-    _cmdline="root=UUID=${BTRFS_UUID} ro rootflags=${_rootflags} ${BASE_CMDLINE}"
+    _luks="$LUKS_CMDLINE"
+    _base="$BASE_CMDLINE"
+    _snippet=""
+    [ -n "$_tree" ] && _snippet=$(lineage_cmdline "$_tree")
+    if [ -n "$_snippet" ]; then
+        # The snippet REPLACES the rd.luks.* parameters for this entry —
+        # including any the admin put in GRUB_CMDLINE_LINUX, which would
+        # otherwise set up a second, conflicting unlock mapping.
+        _luks="$_snippet"
+        _filtered=""
+        for _w in $_base; do
+            case "$_w" in
+                rd.luks.*) ;;
+                *) _filtered="${_filtered:+${_filtered} }${_w}" ;;
+            esac
+        done
+        _base="$_filtered"
+    fi
 
+    _cmdline="root=UUID=${BTRFS_UUID} ro rootflags=subvol=${_subvol}"
+    [ -n "$_luks" ] && _cmdline="${_cmdline} ${_luks}"
+    [ -n "$_base" ] && _cmdline="${_cmdline} ${_base}"
     if [ "$_freshroot" = "yes" ]; then
-        _cmdline="${_cmdline} rd.freshroot"
+        _cmdline="${_cmdline} rd.freshroot=1"
     fi
-    if [ -n "$_extra" ]; then
-        _cmdline="${_cmdline} ${_extra}"
-    fi
+    [ -n "$_extra" ] && _cmdline="${_cmdline} ${_extra}"
 
     cat << ENTRY
 menuentry '${_title}' --class ubuntu --class gnu-linux --class os {
@@ -136,99 +276,248 @@ ENTRY
 # submenu is generated regardless of caller. Clean up on exit.
 _SNAPSHOT_UNMOUNT=0
 if [ -d "$SNAPSHOT_DIR" ] && ! mountpoint -q "$SNAPSHOT_DIR"; then
-    _SNAP_SUBVOL="${SNAPSHOTS_DIR:-@snapshots}"
-    if mount -t btrfs -o "subvol=${_SNAP_SUBVOL},noatime" \
+    if mount -t btrfs -o "subvol=${SNAPSHOTS_DIR},noatime" \
             "$BTRFS_DEVICE" "$SNAPSHOT_DIR" 2>/dev/null; then
         _SNAPSHOT_UNMOUNT=1
         trap '[ "$_SNAPSHOT_UNMOUNT" = "1" ] && umount "$SNAPSHOT_DIR" 2>/dev/null || true' EXIT
     fi
 fi
 
-# --- Find snapshots ---
-SNAPSHOTS=""
+# --- Index read-only snapshots ---
+# SNAP_INDEX lines: "TS<TAB>lineage<TAB>name", TS-sorted oldest first.
+# EXTRA_SNAPSHOTS: RO root.* subvolumes without a valid TS field (excluded
+# from clean entries, still listed in the history menu).
+SNAP_INDEX=""
+EXTRA_SNAPSHOTS=""
 if [ -d "$SNAPSHOT_DIR" ]; then
-    SNAPSHOTS=$(find "$SNAPSHOT_DIR" -maxdepth 1 -name "root.*" -printf '%f\n' 2>/dev/null | sort -r)
-fi
-
-LATEST_SNAP=$(echo "$SNAPSHOTS" | head -1)
-
-# ==========================================================================
-# Entry 1: DEFAULT — Boot from latest snapshot (clean), newest kernel
-# ==========================================================================
-if [ -n "$LATEST_SNAP" ]; then
-    if best_kernel_for "${SNAPSHOT_DIR}/${LATEST_SNAP}"; then
-        emit_entry \
-            "${LABEL} (clean — ${LATEST_SNAP})" \
-            "@snapshots/${LATEST_SNAP}" \
-            "yes" \
-            ""
-    else
-        echo "# WARNING: latest snapshot ${LATEST_SNAP} has no matching kernel in /boot" >&2
-    fi
-else
-    if best_kernel_for "/"; then
-        emit_entry \
-            "${LABEL} (clean — no snapshots, using @)" \
-            "@" \
-            "yes" \
-            ""
-    fi
-fi
-
-# ==========================================================================
-# Entry 2: Tainted — Boot from @ with staging service masked
-# ==========================================================================
-if best_kernel_for "/"; then
-    emit_entry \
-        "${LABEL} (tainted — current root, skip rollback)" \
-        "@" \
-        "" \
-        "systemd.mask=freshroot-update.service systemd.mask=freshroot-update.timer"
-fi
-
-# ==========================================================================
-# Submenus: one per snapshot, each listing all compatible kernels
-# ==========================================================================
-if [ -n "$SNAPSHOTS" ]; then
-    _has_entries=0
-    for snap in $SNAPSHOTS; do
-        if best_kernel_for "${SNAPSHOT_DIR}/${snap}"; then
-            _has_entries=1
-            break
+    for _d in "$SNAPSHOT_DIR"/root.*/; do
+        [ -d "$_d" ] || continue
+        btrfs property get "${_d%/}" ro 2>/dev/null | grep -q 'ro=true' || continue
+        _name="${_d%/}"; _name="${_name##*/}"
+        _ts=$(snap_ts "$_name")
+        if [ -n "$_ts" ]; then
+            _lin=$(snapshot_lineage "${_d%/}")
+            SNAP_INDEX="${SNAP_INDEX}${_ts}${TAB}${_lin}${TAB}${_name}
+"
+        else
+            EXTRA_SNAPSHOTS="${EXTRA_SNAPSHOTS}${_name}
+"
         fi
     done
+    SNAP_INDEX=$(printf '%s' "$SNAP_INDEX" | sort)
+fi
 
-    if [ "$_has_entries" = "1" ]; then
-        echo "submenu '${LABEL} — Snapshot History' --class ubuntu {"
+# All lineages, ordered by their newest snapshot (newest lineage first)
+ALL_LINEAGES=$(printf '%s\n' "$SNAP_INDEX" | awk -F'\t' 'NF==3 { last[$2]=$1 } END { for (l in last) print last[l] "\t" l }' | sort -r | cut -f2)
 
-        for snap in $SNAPSHOTS; do
-            SNAP_KERNELS=$(kernels_for "${SNAPSHOT_DIR}/${snap}")
-            [ -z "$SNAP_KERNELS" ] && continue
-
-            TS="${snap#root.}"
-            if [[ "$TS" =~ ^(....)(..)(..)T(..)(..)(..)$ ]]; then
-                DISPLAY_TS="${BASH_REMATCH[1]}-${BASH_REMATCH[2]}-${BASH_REMATCH[3]} ${BASH_REMATCH[4]}:${BASH_REMATCH[5]}:${BASH_REMATCH[6]}"
-            else
-                DISPLAY_TS="$TS"
-            fi
-
-            echo "  submenu '${DISPLAY_TS} (${snap})' --class ubuntu {"
-
-            for krel in $SNAP_KERNELS; do
-                BK_REL="$krel"
-                BK_VMLINUZ="/vmlinuz-${krel}"
-                BK_INITRD="/initrd.img-${krel}"
-
-                emit_entry \
-                    "    kernel ${krel}" \
-                    "@snapshots/${snap}" \
-                    "yes" \
-                    ""
-            done
-
-            echo "  }"
-        done
-
-        echo "}"
+# The default lineage: the sticky record, else the running system's lineage
+N_LINEAGES=$(printf '%s\n' "$ALL_LINEAGES" | grep -c . 2>/dev/null) || N_LINEAGES=0
+DEFAULT_LINEAGE=""
+if [ -r "$DEFAULT_LINEAGE_FILE" ]; then
+    DEFAULT_LINEAGE=$(head -1 "$DEFAULT_LINEAGE_FILE" 2>/dev/null | tr -cd 'a-zA-Z0-9._-') || DEFAULT_LINEAGE=""
+fi
+if [ -z "$DEFAULT_LINEAGE" ]; then
+    DEFAULT_LINEAGE=$(lineage_of_root "")
+    if [ "$N_LINEAGES" -gt 1 ]; then
+        echo "Warning: ${DEFAULT_LINEAGE_FILE} missing with multiple lineages present — defaulting to the running lineage '${DEFAULT_LINEAGE}'; pin one with 'freshroot-install --switch'" >&2
     fi
+fi
+
+# Does the default lineage actually have snapshots?
+DEFAULT_HAS_SNAPSHOTS=0
+if [ -n "$ALL_LINEAGES" ] && printf '%s\n' "$ALL_LINEAGES" | grep -Fqx "$DEFAULT_LINEAGE"; then
+    DEFAULT_HAS_SNAPSHOTS=1
+fi
+
+# Order lineages: default first (when it has snapshots), rest as-is
+if [ "$DEFAULT_HAS_SNAPSHOTS" = "1" ]; then
+    ORDERED_LINEAGES=$({ printf '%s\n' "$DEFAULT_LINEAGE"; printf '%s\n' "$ALL_LINEAGES" | grep -Fvx "$DEFAULT_LINEAGE" || true; })
+else
+    ORDERED_LINEAGES="$ALL_LINEAGES"
+fi
+
+# Snapshot names of a lineage, newest first
+snaps_in_lineage() {
+    printf '%s\n' "$SNAP_INDEX" | awk -F'\t' -v l="$1" 'NF==3 && $2==l {print $3}' | tac
+}
+
+# --- Emit the clean entry for a lineage ---
+# Walks the lineage newest-to-oldest until a snapshot has a bootable kernel
+# pair (warning when that is not the newest one). Returns 1 if none has.
+emit_clean_for_lineage() {
+    _lin="$1"
+    _newest=""
+    for _snap in $(snaps_in_lineage "$_lin"); do
+        [ -z "$_newest" ] && _newest="$_snap"
+        if best_kernel_for "${SNAPSHOT_DIR}/${_snap}"; then
+            if [ "$_snap" != "$_newest" ]; then
+                echo "Warning: lineage ${_lin}: newest snapshot ${_newest} has no bootable kernel pair — clean entry uses ${_snap}" >&2
+            fi
+            _ts_disp=$(display_ts "$_snap")
+            _cap="yes"
+            _title="${LABEL} (clean — ${_lin} — ${_ts_disp})"
+            if ! ceremony_capable "${SNAPSHOT_DIR}/${_snap}"; then
+                _cap=""
+                _title="${LABEL} (${_lin} — ${_ts_disp} — NO CEREMONY, boots read-only)"
+            fi
+            emit_entry "$_title" "${SNAPSHOTS_DIR}/${_snap}" "${SNAPSHOT_DIR}/${_snap}" "$_cap" ""
+            return 0
+        fi
+    done
+    return 1
+}
+
+# --- Emit the tainted entry (boot @ directly, staging masked) ---
+# The kernel is gated against the @ tree itself: / is the running clone and
+# may belong to a different lineage than @.
+emit_tainted() {
+    _AT_MNT="/run/freshroot-grub-at"
+    _at_root=""
+    if mkdir -p "$_AT_MNT" 2>/dev/null && \
+       mount -t btrfs -o "subvol=${ROOT_SUBVOL},ro" "$BTRFS_DEVICE" "$_AT_MNT" 2>/dev/null; then
+        _at_root="$_AT_MNT"
+    fi
+    if [ -n "$_at_root" ] && best_kernel_for "$_at_root"; then
+        emit_entry \
+            "${LABEL} (tainted — current root, skip rollback)" \
+            "${ROOT_SUBVOL}" \
+            "$_at_root" \
+            "" \
+            "systemd.mask=freshroot-update.service systemd.mask=freshroot-update.timer"
+    elif best_kernel_for "/"; then
+        # Could not inspect @ (or @ has no bootable pair): fall back to the
+        # running tree's view but say so in the title.
+        emit_entry \
+            "${LABEL} (tainted — current root, skip rollback — kernel may lack modules in ${ROOT_SUBVOL})" \
+            "${ROOT_SUBVOL}" \
+            "" \
+            "" \
+            "systemd.mask=freshroot-update.service systemd.mask=freshroot-update.timer"
+    fi
+    if [ -n "$_at_root" ]; then
+        umount "$_AT_MNT" 2>/dev/null || true
+    fi
+}
+
+# ==========================================================================
+# Entries. GRUB_DEFAULT=0 boots the FIRST entry emitted here: the default
+# lineage's clean entry, or — when the default lineage has no snapshots or
+# no bootable one — the tainted entry (never another lineage's clean entry).
+# ==========================================================================
+FIRST_LINEAGE=""
+REMAINING_LINEAGES="$ORDERED_LINEAGES"
+if [ "$DEFAULT_HAS_SNAPSHOTS" = "1" ]; then
+    FIRST_LINEAGE=$(printf '%s\n' "$ORDERED_LINEAGES" | head -1)
+    REMAINING_LINEAGES=$(printf '%s\n' "$ORDERED_LINEAGES" | tail -n +2)
+fi
+
+TAINTED_DONE=0
+if [ -z "$ALL_LINEAGES" ]; then
+    # No timestamped snapshots. Preserve the pre-lineage invariant that the
+    # lexically newest root.* snapshot is the default (e.g. a hand-pinned
+    # root.golden); fall back to booting @ immutably when none exists.
+    _def_emitted=0
+    if [ -n "$EXTRA_SNAPSHOTS" ]; then
+        _snap=$(printf '%s\n' "$EXTRA_SNAPSHOTS" | grep . | sort -r | head -1) || _snap=""
+        if [ -n "$_snap" ] && best_kernel_for "${SNAPSHOT_DIR}/${_snap}"; then
+            _cap="yes"
+            _title="${LABEL} (clean — ${_snap})"
+            if ! ceremony_capable "${SNAPSHOT_DIR}/${_snap}"; then
+                _cap=""
+                _title="${LABEL} (${_snap} — NO CEREMONY, boots read-only)"
+            fi
+            emit_entry "$_title" "${SNAPSHOTS_DIR}/${_snap}" "${SNAPSHOT_DIR}/${_snap}" "$_cap" ""
+            _def_emitted=1
+        fi
+    fi
+    if [ "$_def_emitted" = "0" ] && best_kernel_for "/"; then
+        emit_entry \
+            "${LABEL} (clean — no snapshots, using ${ROOT_SUBVOL})" \
+            "${ROOT_SUBVOL}" \
+            "" \
+            "yes" \
+            ""
+    fi
+elif [ -z "$FIRST_LINEAGE" ]; then
+    echo "Warning: default lineage ${DEFAULT_LINEAGE} has no snapshots — tainted entry promoted; pick a new default with 'freshroot-install --switch'" >&2
+    emit_tainted
+    TAINTED_DONE=1
+elif emit_clean_for_lineage "$FIRST_LINEAGE"; then
+    :
+else
+    echo "Warning: default lineage ${FIRST_LINEAGE} has no bootable snapshot — tainted entry promoted" >&2
+    emit_tainted
+    TAINTED_DONE=1
+fi
+
+for _lin in $REMAINING_LINEAGES; do
+    emit_clean_for_lineage "$_lin" || \
+        echo "Warning: lineage ${_lin} has no bootable snapshot in /boot" >&2
+done
+
+if [ "$TAINTED_DONE" = "0" ]; then
+    emit_tainted
+fi
+
+# ==========================================================================
+# History submenus: one per lineage, each snapshot with all its kernels
+# ==========================================================================
+
+# Emit one snapshot's inner submenu (one entry per compatible kernel).
+# No-op when the snapshot has no bootable kernel pair.
+emit_snap_submenu() {
+    _snap="$1"
+    _menu_title="$2"
+    SNAP_KERNELS=$(kernels_for "${SNAPSHOT_DIR}/${_snap}")
+    [ -n "$SNAP_KERNELS" ] || return 0
+    _cap="yes"; _capnote=""
+    if ! ceremony_capable "${SNAPSHOT_DIR}/${_snap}"; then
+        _cap=""; _capnote=" — NO CEREMONY"
+    fi
+    echo "  submenu '${_menu_title}${_capnote}' --class ubuntu {"
+    for _krel in $SNAP_KERNELS; do
+        BK_REL="$_krel"
+        BK_VMLINUZ="/vmlinuz-${_krel}"
+        BK_INITRD="${INITRD_PATH[$_krel]-}"
+        emit_entry \
+            "    kernel ${_krel}" \
+            "${SNAPSHOTS_DIR}/${_snap}" \
+            "${SNAPSHOT_DIR}/${_snap}" \
+            "$_cap" \
+            ""
+    done
+    echo "  }"
+}
+
+# True when at least one snapshot in the (whitespace-separated) list has a
+# bootable kernel pair — gates whether an outer submenu is opened at all.
+any_bootable_in() {
+    for _snap in $1; do
+        if [ -n "$(kernels_for "${SNAPSHOT_DIR}/${_snap}")" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+for _lin in $ORDERED_LINEAGES; do
+    _lin_snaps=$(snaps_in_lineage "$_lin")
+    [ -n "$_lin_snaps" ] || continue
+    any_bootable_in "$_lin_snaps" || continue
+
+    echo "submenu '${LABEL} — ${_lin} — Snapshot History' --class ubuntu {"
+    for _snap in $_lin_snaps; do
+        emit_snap_submenu "$_snap" "$(display_ts "$_snap") (${_snap})"
+    done
+    echo "}"
+done
+
+# Snapshots whose names carry no valid timestamp (e.g. hand-made root.golden):
+# excluded from clean entries and pruning, still selectable here.
+if [ -n "$EXTRA_SNAPSHOTS" ] && any_bootable_in "$EXTRA_SNAPSHOTS"; then
+    echo "submenu '${LABEL} — Other Snapshots' --class ubuntu {"
+    for _snap in $EXTRA_SNAPSHOTS; do
+        emit_snap_submenu "$_snap" "$_snap"
+    done
+    echo "}"
 fi

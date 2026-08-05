@@ -30,7 +30,9 @@ This is **not** a general-purpose tool. It targets a specific architecture: LUKS
  │  @              original root (reference, not booted directly in clean mode)                     │
  │  @rootfs        ephemeral writable clone (created fresh each boot by dracut)                     │
  │  @staging       transient writable clone (exists only during updates)                            │
- │  @snapshots/    read-only snapshots (root.YYYYMMDDTHHMMSS)                                       │
+ │  @snapshots/    read-only snapshots, grouped into per-release "lineages"                         │
+ │                 (root.<lineage>.YYYYMMDDTHHMMSS; legacy root.YYYYMMDDTHHMMSS                     │
+ │                 resolves its lineage from the os-release inside the snapshot)                    │
  │  @home, @log, @apt-cache, @tmp, @spool, @crash, @containers, @flatpak,                           │
  │  @snap, @libvirt, @AccountsService, @gdm3, @bluetooth, @cups, @fwupd,                            │
  │  @netmanager, @machine-id, @swap                                                                 │
@@ -56,12 +58,19 @@ This is **not** a general-purpose tool. It targets a specific architecture: LUKS
 
 8. **Subvolume lists must stay in sync.** The list of persistent subvolumes appears in multiple places: Phase 2 (create), Phase 3 (migrate), Phase 4 (fstab), and Phase 7 (cleanup whitelist). Adding or removing a subvolume requires updating ALL of these.
 
+9. **The lineage helper corpus is copied.** `snap_ts`, `snap_label`, `lineage_of_root`, `snapshot_lineage`, `lineage_quota`, `list_ro_snapshots`, `booted_snapshot`, `current_lineage`, `ensure_default_lineage`, `prune_snapshots`, `resolve_from_ref` and the update-grub suppress/restore helpers are copied between `freshroot-update`, `freshroot-build` and `freshroot-install` (each omits helpers it does not use). `06_freshroot` carries a PARTIAL copy (`snap_ts`, `snap_label`, `lineage_of_root`, `snapshot_lineage` plus inline snapshot indexing) — bash, but running under plain `set -e` without `-u`/`pipefail`, so every per-snapshot lookup there must be ||-guarded. `installer/freshroot-setup` Phase 9 re-derives the lineage with the same parsing rules. The tools deliberately share no library — fix a bug in every copy. All snapshot ordering sorts on the parsed TIMESTAMP field, never on raw names (lineage-prefixed names sort after legacy names lexically).
+
+10. **New config keys never reach existing installs automatically.** `freshroot-setup` rewrites the conffile at install time, so dpkg keeps the old version on upgrades. Every tool must initialize new keys before sourcing the conf (`LINEAGE_QUOTAS=()` etc.) and guard every lookup; `06_freshroot` must do the same without `set -u`. The default boot lineage therefore lives OUTSIDE the conffile, in `/boot/freshroot/default-lineage` (written by `freshroot-install --switch`, seeded by the installer / first lineage-aware run).
+
 ## File roles
 
 | File | Runs when | Runs where | Purpose |
 |---|---|---|---|
 | `installer/freshroot-setup` | Install time (late-commands) | Installer environment | 11-phase bootstrap: subvolumes, fstab, crypttab, migration, tweaks, snapshot, dracut, GRUB |
-| `data/usr/sbin/freshroot-update` | Runtime (timer or manual) | Running system | Stage updates in nspawn, snapshot result, prune old snapshots, update GRUB |
+| `data/usr/sbin/freshroot-update` | Runtime (timer or manual) | Running system | Stage updates in nspawn on the booted lineage, snapshot result, per-lineage pruning, update GRUB |
+| `data/usr/sbin/freshroot-build` | Runtime (timer or manual) | Running system | Two-tier "from scratch" builds: vanilla-upgrade pinned `@base`, then component layer from a fresh clone |
+| `data/usr/sbin/freshroot-install` | Runtime (manual) | Running system | Lineage management: `--release` (stage an Ubuntu release upgrade as a NEW lineage), `--import` (foreign rootfs), `--switch` (sticky default boot lineage), `--remove` |
+| `data/usr/lib/freshroot/ceremony` | Read by `06_freshroot` | Inside each snapshot tree | Boot-ceremony capability marker (contains the ceremony version, `1`); trees without it (or the dracut module) get GRUB entries without `rd.freshroot` |
 | `data/etc/freshroot-update.conf` | Sourced by freshroot-update | Running system | Config: REPOS, subvol names, retention, boot partitions, log dir |
 | `data/etc/grub.d/06_freshroot` | `update-grub` | Running system | Generate GRUB entries: clean (latest snapshot), tainted (@), snapshot history submenu |
 | `data/etc/default/grub.d/freshroot.cfg` | `update-grub` | Running system | GRUB defaults: timeout, default entry, disable os-prober |
@@ -84,7 +93,7 @@ This is **not** a general-purpose tool. It targets a specific architecture: LUKS
 ### Making the change
 
 4. **Edit the minimum necessary.** Do not refactor surrounding code, add comments to unchanged lines, or "improve" things that weren't asked for.
-5. **Maintain sync points.** If you add a persistent subvolume, update: Phase 2 (create), Phase 3 (migrate_sv call), Phase 4 (fstab line), Phase 7 (whitelist case). If you rename a file, grep the entire project.
+5. **Maintain sync points.** If you add a persistent subvolume, update: Phase 2 (create), Phase 3 (migrate_sv call), Phase 4 (fstab line), Phase 7 (whitelist case). If you touch a lineage helper or `protect_snapshot_kernels`, fix all copies: `freshroot-update`, `freshroot-build`, `freshroot-install`, and the sh-dialect copy in `06_freshroot`. If you rename a file, grep the entire project.
 6. **Respect permissions.** Config files under `data/etc/` must be 644. Executable scripts must be 755. Set permissions on the source files in `data/`, not in `debian/rules`.
 7. **No `debian/conffiles` needed.** debhelper auto-detects files under `/etc/` as conffiles.
 8. **`debian/rules` overrides `dh_auto_build` and `dh_auto_clean` as no-ops** to prevent debhelper from recursively invoking the project Makefile.
@@ -110,6 +119,9 @@ This is **not** a general-purpose tool. It targets a specific architecture: LUKS
 - **Forgetting `--resolv-conf=bind-stub`** on nspawn invocations — DNS will fail.
 - **Referencing uninitialized variables under `set -u`** — especially in nspawn shells where bash profiles source scripts that assume `SUDO_USER` etc. exist.
 - **Editing subvolume lists in only one place** — they appear in 4 places in the bootstrap script.
+- **Editing lineage helpers in only one file** — they are copied into freshroot-update, freshroot-build, freshroot-install AND 06_freshroot (which runs without `set -u`/`pipefail`).
+- **Sorting snapshots by name** — `root.<lineage>.<TS>` sorts after `root.<TS>` lexically; always sort on the parsed timestamp field.
+- **Referencing a new conf key without a pre-source default** — upgraded systems keep their old conffile; under `set -u` an unguarded `${LINEAGE_QUOTAS[@]}` aborts the update timer.
 - **Using `dh clean` in the Makefile `clean` target** — causes infinite recursion because debhelper calls `make clean`.
 - **Adding `--buildinfo-option=-u` or `--changes-option=-u` to dpkg-buildpackage** — these flags specify where to READ files, not where to WRITE them.
 - **Forgetting the self-relocation in freshroot-setup** — Phase 7 deletes /target/* (non-subvolume entries), which includes the script itself if it's still running from /target.

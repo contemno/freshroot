@@ -253,8 +253,41 @@ fi
 # Phase 9: Baseline snapshot
 # ══════════════════════════════════════════════════════════════════════
 info "Phase 9: Creating baseline snapshot"
+
+# Name the baseline with its lineage (root.<id>-<version>.<timestamp>) so
+# per-lineage retention and GRUB grouping work from the first boot. The
+# os-release is parsed (never sourced); an unreadable one falls back to the
+# legacy root.<timestamp> name, which the runtime tools resolve lazily.
+# SYNC: this derivation mirrors lineage_of_root in freshroot-update /
+# freshroot-build / freshroot-install / 06_freshroot — if the parsing or
+# sanitization rules change there, change them here too.
+OSR=""
+if [ -r "$T/usr/lib/os-release" ]; then
+    OSR="$T/usr/lib/os-release"
+elif [ -r "$T/etc/os-release" ]; then
+    OSR="$T/etc/os-release"
+fi
+LINEAGE=""
+if [ -n "$OSR" ]; then
+    OSR_ID=$(sed -n 's/^ID=//p' "$OSR" | head -1 | tr -d '"' \
+             | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9._-')
+    OSR_VER=$(sed -n 's/^VERSION_ID=//p' "$OSR" | head -1 | tr -d '"' \
+              | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9._-')
+    if [ -n "$OSR_ID" ] && [ -n "$OSR_VER" ]; then
+        LINEAGE="${OSR_ID}-${OSR_VER}"
+    elif [ -n "$OSR_ID" ]; then
+        LINEAGE="$OSR_ID"
+    fi
+fi
+
 TIMESTAMP=$(date +%Y%m%dT%H%M%S)
-btrfs subvolume snapshot -r /target/@ "/target/@snapshots/root.$TIMESTAMP"
+if [ -n "$LINEAGE" ]; then
+    BASELINE="root.${LINEAGE}.${TIMESTAMP}"
+else
+    BASELINE="root.${TIMESTAMP}"
+fi
+btrfs subvolume snapshot -r /target/@ "/target/@snapshots/${BASELINE}"
+info "  baseline snapshot: ${BASELINE}"
 
 # Pinned vanilla base for two-tier builds (freshroot-build). Writable, a sibling
 # of @, NOT under @snapshots and NOT named root.* — so GRUB and snapshot pruning
@@ -274,6 +307,13 @@ info "Phase 10: Configuring dracut and GRUB"
 mount -t btrfs -o subvol=@,noatime "$BTRFS_DEV" /target/@
 mount -L BOOT "$T/boot"
 mount -L EFI  "$T/boot/efi"
+
+# Seed the sticky default-lineage record read by 06_freshroot, so GRUB
+# entry ordering never changes without an explicit freshroot-install --switch
+if [ -n "$LINEAGE" ]; then
+    mkdir -p "$T/boot/freshroot"
+    echo "$LINEAGE" > "$T/boot/freshroot/default-lineage"
+fi
 
 curtin in-target --target="$T" -- dracut --regenerate-all --force || true
 curtin in-target --target="$T" -- chmod -x "/etc/grub.d/10_linux"

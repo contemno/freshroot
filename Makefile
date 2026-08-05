@@ -6,6 +6,7 @@ SETUP    := target/freshroot-setup
 
 SCRIPTS  := data/usr/sbin/freshroot-update \
             data/usr/sbin/freshroot-build \
+            data/usr/sbin/freshroot-install \
             installer/freshroot-setup \
             data/usr/lib/dracut/modules.d/90freshroot/module-setup.sh \
             data/usr/lib/dracut/modules.d/90freshroot/freshroot-setup.sh \
