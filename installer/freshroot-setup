@@ -316,6 +316,30 @@ if [ -n "$LINEAGE" ]; then
 fi
 
 curtin in-target --target="$T" -- dracut --regenerate-all --force || true
+
+# Freeze the baseline snapshot's kernel pair(s) as hardlinks under
+# /boot/freshroot/<name>/ — 06_freshroot points its GRUB entries there, so
+# later kernel removals can never strand the baseline.
+# SYNC: mirrors archive_boot_kernels in freshroot-update / freshroot-build /
+# freshroot-install — if the archive layout or pairing rules change there,
+# change them here too.
+info "  archiving baseline kernels to /boot/freshroot/${BASELINE}"
+mkdir -p "$T/boot/freshroot/${BASELINE}"
+for MOD_DIR in "/target/@snapshots/${BASELINE}/usr/lib/modules"/*/; do
+    [ -d "$MOD_DIR" ] || continue
+    KREL=$(basename "$MOD_DIR")
+    [ -f "$T/boot/vmlinuz-${KREL}" ] || continue
+    INITRD=""
+    if [ -f "$T/boot/initrd.img-${KREL}" ]; then
+        INITRD="initrd.img-${KREL}"
+    elif [ -f "$T/boot/initramfs-${KREL}.img" ]; then
+        INITRD="initramfs-${KREL}.img"
+    fi
+    [ -n "$INITRD" ] || continue
+    ln -f "$T/boot/vmlinuz-${KREL}" "$T/boot/freshroot/${BASELINE}/vmlinuz-${KREL}"
+    ln -f "$T/boot/${INITRD}"       "$T/boot/freshroot/${BASELINE}/${INITRD}"
+done
+
 curtin in-target --target="$T" -- chmod -x "/etc/grub.d/10_linux"
 curtin in-target --target="$T" -- update-grub
 curtin in-target --target="$T" -- grub-install \
