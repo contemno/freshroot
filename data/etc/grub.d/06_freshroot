@@ -30,8 +30,11 @@
 # read-only snapshot directly. A snapshot may ship /etc/freshroot/cmdline
 # (single line) to replace the auto-generated rd.luks.* parameters.
 #
-# Each entry is paired only with kernels whose modules exist inside the
-# target root, preventing kernel panics from missing modules. Initrds are
+# Kernel pairing prefers a tree's /boot/freshroot/<name>/ archive — the
+# vmlinuz+initrd hardlinks frozen at snapshot commit time (written by
+# freshroot-update/-build/-install; this script only READS the layout).
+# Trees without a usable archive fall back to the flat names, paired only
+# with kernels whose modules exist inside the target root. Flat initrds are
 # looked up as /boot/initrd.img-<kver> or /boot/initramfs-<kver>.img.
 #
 # This script runs under plain `set -e` (no -u/pipefail) inside
@@ -57,6 +60,7 @@ fi
 
 SNAPSHOT_DIR="/.snapshots"
 DEFAULT_LINEAGE_FILE="/boot/freshroot/default-lineage"
+BOOT_ARCHIVE_DIR="/boot/freshroot"
 TAB=$(printf '\t')
 BTRFS_DEVICE=$(findmnt -n -o SOURCE / | sed 's/\[.*\]//')
 BTRFS_UUID=$(findmnt -n -o UUID /)
@@ -171,10 +175,11 @@ display_ts() {
     fi
 }
 
-# --- Collect all kernels available in /boot, newest first ---
+# --- Collect all kernels available in flat /boot, newest first ---
 ALL_BOOT_KERNELS=$(for f in /boot/vmlinuz-*; do [ -e "$f" ] && echo "${f##*/vmlinuz-}"; done | sort -rV)
 
-if [ -z "$ALL_BOOT_KERNELS" ]; then
+if [ -z "$ALL_BOOT_KERNELS" ] && \
+   ! ls "${BOOT_ARCHIVE_DIR}"/*/vmlinuz-* >/dev/null 2>&1; then
     echo "Warning: No kernels found in /boot" >&2
     exit 0
 fi
@@ -191,30 +196,62 @@ for _krel in $ALL_BOOT_KERNELS; do
     fi
 done
 
+# --- Bootable kernel pairs frozen in a tree's /boot archive ---
+# Emits "kver vmlinuz initrd" lines (paths relative to the BOOT filesystem
+# root), newest first. Empty when the archive dir is missing or holds no
+# complete pair.
+archive_kernel_lines() {
+    _adir="${BOOT_ARCHIVE_DIR}/$1"
+    [ -d "$_adir" ] || return 0
+    for _f in "$_adir"/vmlinuz-*; do
+        [ -f "$_f" ] || continue
+        _k="${_f##*/vmlinuz-}"
+        if [ -f "${_adir}/initrd.img-${_k}" ]; then
+            printf '%s /freshroot/%s/vmlinuz-%s /freshroot/%s/initrd.img-%s\n' \
+                "$_k" "$1" "$_k" "$1" "$_k"
+        elif [ -f "${_adir}/initramfs-${_k}.img" ]; then
+            printf '%s /freshroot/%s/vmlinuz-%s /freshroot/%s/initramfs-%s.img\n' \
+                "$_k" "$1" "$_k" "$1" "$_k"
+        fi
+    done | sort -rV
+    return 0
+}
+
 # --- Find kernels compatible with a given root path ---
-# Returns matching kernel versions (newest first) on stdout.
-# A kernel is compatible if its modules dir exists inside the root
-# AND a matching initrd exists in /boot.
+# $1 = tree root, $2 = archive name ('' = flat lookup only). Emits
+# "kver vmlinuz initrd" lines, newest first. The tree's archive is
+# authoritative when it holds any complete pair (it was frozen from the
+# tree's own module list at commit time); otherwise a kernel is compatible
+# if its modules dir exists inside the root AND a matching flat initrd
+# exists in /boot.
 kernels_for() {
     _root="$1"
+    _kf_lines=""
+    if [ -n "${2:-}" ]; then
+        _kf_lines=$(archive_kernel_lines "$2") || _kf_lines=""
+    fi
+    if [ -n "$_kf_lines" ]; then
+        printf '%s\n' "$_kf_lines"
+        return 0
+    fi
     for _krel in $ALL_BOOT_KERNELS; do
         if [ -d "${_root}/usr/lib/modules/${_krel}" ] && \
            [ -n "${INITRD_PATH[$_krel]-}" ]; then
-            echo "$_krel"
+            printf '%s /vmlinuz-%s %s\n' "$_krel" "$_krel" "${INITRD_PATH[$_krel]}"
         fi
     done
+    return 0
 }
 
 # --- Find the newest compatible kernel for a root path ---
+# $1 = tree root, $2 = archive name (''= flat lookup only).
 # Sets BK_REL, BK_VMLINUZ, BK_INITRD. Returns 1 if none.
 best_kernel_for() {
-    _krel=$(kernels_for "$1" | head -1)
-    if [ -z "$_krel" ]; then
+    _bk_line=$(kernels_for "$1" "${2:-}" | head -1)
+    if [ -z "$_bk_line" ]; then
         return 1
     fi
-    BK_REL="$_krel"
-    BK_VMLINUZ="/vmlinuz-${_krel}"
-    BK_INITRD="${INITRD_PATH[$_krel]-}"
+    read -r BK_REL BK_VMLINUZ BK_INITRD <<< "$_bk_line"
     return 0
 }
 
@@ -349,7 +386,7 @@ emit_clean_for_lineage() {
     _newest=""
     for _snap in $(snaps_in_lineage "$_lin"); do
         [ -z "$_newest" ] && _newest="$_snap"
-        if best_kernel_for "${SNAPSHOT_DIR}/${_snap}"; then
+        if best_kernel_for "${SNAPSHOT_DIR}/${_snap}" "$_snap"; then
             if [ "$_snap" != "$_newest" ]; then
                 echo "Warning: lineage ${_lin}: newest snapshot ${_newest} has no bootable kernel pair — clean entry uses ${_snap}" >&2
             fi
@@ -377,14 +414,14 @@ emit_tainted() {
        mount -t btrfs -o "subvol=${ROOT_SUBVOL},ro" "$BTRFS_DEVICE" "$_AT_MNT" 2>/dev/null; then
         _at_root="$_AT_MNT"
     fi
-    if [ -n "$_at_root" ] && best_kernel_for "$_at_root"; then
+    if [ -n "$_at_root" ] && best_kernel_for "$_at_root" "${ROOT_SUBVOL}"; then
         emit_entry \
             "${LABEL} (tainted — current root, skip rollback)" \
             "${ROOT_SUBVOL}" \
             "$_at_root" \
             "" \
             "systemd.mask=freshroot-update.service systemd.mask=freshroot-update.timer"
-    elif best_kernel_for "/"; then
+    elif best_kernel_for "/" "${ROOT_SUBVOL}"; then
         # Could not inspect @ (or @ has no bootable pair): fall back to the
         # running tree's view but say so in the title.
         emit_entry \
@@ -419,7 +456,7 @@ if [ -z "$ALL_LINEAGES" ]; then
     _def_emitted=0
     if [ -n "$EXTRA_SNAPSHOTS" ]; then
         _snap=$(printf '%s\n' "$EXTRA_SNAPSHOTS" | grep . | sort -r | head -1) || _snap=""
-        if [ -n "$_snap" ] && best_kernel_for "${SNAPSHOT_DIR}/${_snap}"; then
+        if [ -n "$_snap" ] && best_kernel_for "${SNAPSHOT_DIR}/${_snap}" "$_snap"; then
             _cap="yes"
             _title="${LABEL} (clean — ${_snap})"
             if ! ceremony_capable "${SNAPSHOT_DIR}/${_snap}"; then
@@ -430,7 +467,7 @@ if [ -z "$ALL_LINEAGES" ]; then
             _def_emitted=1
         fi
     fi
-    if [ "$_def_emitted" = "0" ] && best_kernel_for "/"; then
+    if [ "$_def_emitted" = "0" ] && best_kernel_for "/" "${ROOT_SUBVOL}"; then
         emit_entry \
             "${LABEL} (clean — no snapshots, using ${ROOT_SUBVOL})" \
             "${ROOT_SUBVOL}" \
@@ -468,24 +505,22 @@ fi
 emit_snap_submenu() {
     _snap="$1"
     _menu_title="$2"
-    SNAP_KERNELS=$(kernels_for "${SNAPSHOT_DIR}/${_snap}")
+    SNAP_KERNELS=$(kernels_for "${SNAPSHOT_DIR}/${_snap}" "$_snap")
     [ -n "$SNAP_KERNELS" ] || return 0
     _cap="yes"; _capnote=""
     if ! ceremony_capable "${SNAPSHOT_DIR}/${_snap}"; then
         _cap=""; _capnote=" — NO CEREMONY"
     fi
     echo "  submenu '${_menu_title}${_capnote}' --class ubuntu {"
-    for _krel in $SNAP_KERNELS; do
-        BK_REL="$_krel"
-        BK_VMLINUZ="/vmlinuz-${_krel}"
-        BK_INITRD="${INITRD_PATH[$_krel]-}"
+    while read -r BK_REL BK_VMLINUZ BK_INITRD; do
+        [ -n "$BK_REL" ] || continue
         emit_entry \
-            "    kernel ${_krel}" \
+            "    kernel ${BK_REL}" \
             "${SNAPSHOTS_DIR}/${_snap}" \
             "${SNAPSHOT_DIR}/${_snap}" \
             "$_cap" \
             ""
-    done
+    done <<< "$SNAP_KERNELS"
     echo "  }"
 }
 
@@ -493,7 +528,7 @@ emit_snap_submenu() {
 # bootable kernel pair — gates whether an outer submenu is opened at all.
 any_bootable_in() {
     for _snap in $1; do
-        if [ -n "$(kernels_for "${SNAPSHOT_DIR}/${_snap}")" ]; then
+        if [ -n "$(kernels_for "${SNAPSHOT_DIR}/${_snap}" "$_snap")" ]; then
             return 0
         fi
     done
