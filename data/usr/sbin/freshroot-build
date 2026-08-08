@@ -67,7 +67,7 @@ source "$CONF"
 
 # ── Globals ──────────────────────────────────────────────────────────
 TOPLEVEL="/run/freshroot-build/btrfs-toplevel"
-TS="$(date +%Y%m%dT%H%M%S)"
+TS="$(date -u +%Y%m%dT%H%M%S)"
 # Shared with freshroot-update so build and update are mutually exclusive
 # (both manipulate @staging, the top-level mount and update-grub).
 LOCKFILE="/run/freshroot-update.lock"
@@ -80,8 +80,8 @@ BUILD_RUN_CLOUD_INIT="${BUILD_RUN_CLOUD_INIT:-0}"
 
 # ── Helpers ──────────────────────────────────────────────────────────
 die()  { echo "FATAL: $*" | tee -a "$LOG_FILE" >&2; exit 1; }
-info() { echo "[$(date +%H:%M:%S)] $*" | tee -a "$LOG_FILE"; }
-warn() { echo "[$(date +%H:%M:%S)] WARNING: $*" | tee -a "$LOG_FILE" >&2; }
+info() { echo "[$(date -u +%H:%M:%S)] $*" | tee -a "$LOG_FILE"; }
+warn() { echo "[$(date -u +%H:%M:%S)] WARNING: $*" | tee -a "$LOG_FILE" >&2; }
 
 # Bind / unbind the shared /boot (+EFI) partitions into a subvolume tree so
 # kernel installs inside the container land on the real boot partition.
@@ -712,7 +712,7 @@ fi
 # The lineage label is derived from the staged tree's os-release (@base has
 # no label of its own).
 NEW_LINEAGE=$(lineage_of_root "$STAGING_PATH")
-NEW_TS="$(date +%Y%m%dT%H%M%S)"
+NEW_TS="$(date -u +%Y%m%dT%H%M%S)"
 if [[ "$NEW_LINEAGE" != "unknown" ]]; then
     NEW_NAME="root.${NEW_LINEAGE}.${NEW_TS}"
 else
