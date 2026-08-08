@@ -74,7 +74,13 @@ fi
 
 # Base kernel command line, and the dracut LUKS parameters (kept separate:
 # a snapshot's /etc/freshroot/cmdline replaces the LUKS part per entry).
+# All freshroot entries are normal (non-recovery) boots, so both
+# GRUB_CMDLINE_LINUX and GRUB_CMDLINE_LINUX_DEFAULT apply, in the same
+# order 10_linux uses.
 BASE_CMDLINE="${GRUB_CMDLINE_LINUX:-}"
+if [ -n "${GRUB_CMDLINE_LINUX_DEFAULT:-}" ]; then
+    BASE_CMDLINE="${BASE_CMDLINE:+${BASE_CMDLINE} }${GRUB_CMDLINE_LINUX_DEFAULT}"
+fi
 LUKS_CMDLINE=""
 if [ -n "$CRYPT_UUID" ]; then
     echo "$BASE_CMDLINE" | grep -q "rd.luks.uuid=" || \
@@ -233,7 +239,8 @@ emit_entry() {
     [ -n "$_tree" ] && _snippet=$(lineage_cmdline "$_tree")
     if [ -n "$_snippet" ]; then
         # The snippet REPLACES the rd.luks.* parameters for this entry —
-        # including any the admin put in GRUB_CMDLINE_LINUX, which would
+        # including any the admin put in GRUB_CMDLINE_LINUX or
+        # GRUB_CMDLINE_LINUX_DEFAULT, which would
         # otherwise set up a second, conflicting unlock mapping.
         _luks="$_snippet"
         _filtered=""
