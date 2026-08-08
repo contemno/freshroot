@@ -65,15 +65,15 @@ BASE_SUBVOL="${BASE_SUBVOL:-@base}"
 
 # ── Globals ──────────────────────────────────────────────────────────
 TOPLEVEL="/run/freshroot-update/btrfs-toplevel"
-TS="$(date +%Y%m%dT%H%M%S)"
+TS="$(date -u +%Y%m%dT%H%M%S)"
 LOCKFILE="/run/freshroot-update.lock"
 LOG_FILE="${LOG_DIR}/update-${TS}.log"
 DEFAULT_LINEAGE_FILE="/boot/freshroot/default-lineage"
 
 # ── Helpers ──────────────────────────────────────────────────────────
 die()  { echo "FATAL: $*" | tee -a "$LOG_FILE" >&2; exit 1; }
-info() { echo "[$(date +%H:%M:%S)] $*" | tee -a "$LOG_FILE"; }
-warn() { echo "[$(date +%H:%M:%S)] WARNING: $*" | tee -a "$LOG_FILE" >&2; }
+info() { echo "[$(date -u +%H:%M:%S)] $*" | tee -a "$LOG_FILE"; }
+warn() { echo "[$(date -u +%H:%M:%S)] WARNING: $*" | tee -a "$LOG_FILE" >&2; }
 
 cleanup() {
     local rc=$?
@@ -735,7 +735,7 @@ else
     NEW_LINEAGE=$(lineage_of_root "$STAGING_PATH")
 fi
 
-NEW_TS="$(date +%Y%m%dT%H%M%S)"
+NEW_TS="$(date -u +%Y%m%dT%H%M%S)"
 if [[ -n "$NEW_LINEAGE" && "$NEW_LINEAGE" != "unknown" ]]; then
     NEW_NAME="root.${NEW_LINEAGE}.${NEW_TS}"
 else
