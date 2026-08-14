@@ -1,0 +1,374 @@
+#!/bin/bash
+# dracut-luks-setup
+#
+# Switch a running Ubuntu system from initramfs-tools to dracut and configure
+# it to unlock a LUKS-encrypted root at boot.
+#
+# This tool does ONE thing: make the initramfs able to open the LUKS container
+# holding /. It does not touch fstab, partitioning, subvolumes, snapshots, or
+# key material, and it works with any root filesystem (ext4, btrfs, xfs) and
+# with or without LVM between LUKS and the root device.
+#
+# Usage:
+#   sudo dracut-luks-setup [--dry-run] [--yes] [--no-install]
+#                          [--name NAME] [--uuid UUID]
+#
+# See README.md for the recovery path if a boot goes wrong.
+
+set -euo pipefail
+
+PROGNAME="dracut-luks-setup"
+STAMP=$(date -u +%Y%m%dT%H%M%S)
+
+CRYPTTAB="/etc/crypttab"
+DRACUT_CONF="/etc/dracut.conf.d/luks.conf"
+GRUB_DROPIN="/etc/default/grub.d/dracut-luks.cfg"
+
+die()  { echo "FATAL: $*" >&2; exit 1; }
+info() { echo "[$PROGNAME] $*"; }
+warn() { echo "[$PROGNAME] WARNING: $*" >&2; }
+
+usage() {
+    sed -n '3,17p' "$0" | sed 's/^# \{0,1\}//'
+    exit 0
+}
+
+# ── Arguments ─────────────────────────────────────────────────────────
+DRY_RUN=0
+ASSUME_YES=0
+NO_INSTALL=0
+OPT_NAME=""
+OPT_UUID=""
+LSBLK_FIXTURE=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --dry-run)        DRY_RUN=1 ;;
+        --yes|-y)         ASSUME_YES=1 ;;
+        --no-install)     NO_INSTALL=1 ;;
+        --name)           OPT_NAME="${2:-}"; shift ;;
+        --uuid)           OPT_UUID="${2:-}"; shift ;;
+        # Testing hook: read the block-device ancestry from a file instead of
+        # probing the live system. Implies --dry-run; see README "Testing".
+        --lsblk-fixture)  LSBLK_FIXTURE="${2:-}"; DRY_RUN=1; shift ;;
+        --help|-h)        usage ;;
+        *)                die "unknown argument: $1 (try --help)" ;;
+    esac
+    shift
+done
+
+if [[ -n "$LSBLK_FIXTURE" && ! -r "$LSBLK_FIXTURE" ]]; then
+    die "fixture not readable: $LSBLK_FIXTURE"
+fi
+
+if [[ -z "$LSBLK_FIXTURE" && $EUID -ne 0 ]]; then
+    die "must run as root"
+fi
+
+# ── Discovery ─────────────────────────────────────────────────────────
+# Walk the block-device ancestry of / upwards until a crypto_LUKS parent is
+# found. The chain is device-first, so for LUKS -> LVM -> ext4 it reads:
+#
+#   /dev/mapper/vg-root  lvm   ext4         <fs uuid>
+#   /dev/mapper/dm_crypt-0 crypt LVM2_member <pv uuid>
+#   /dev/nvme0n1p3       part  crypto_LUKS  <luks uuid>
+#   /dev/nvme0n1         disk
+#
+# and for a plain LUKS -> btrfs root it is the same minus the lvm row. The
+# unlock mapping is the `crypt` row closest to the crypto_LUKS row, which is
+# the one dracut must recreate.
+
+ancestry() {
+    if [[ -n "$LSBLK_FIXTURE" ]]; then
+        cat "$LSBLK_FIXTURE"
+        return 0
+    fi
+    lsblk -nspo NAME,TYPE,FSTYPE,UUID "$1"
+}
+
+ROOT_SRC=""
+if [[ -z "$LSBLK_FIXTURE" ]]; then
+    ROOT_SRC=$(findmnt -n -o SOURCE / | head -1)
+    # Strip a btrfs subvolume suffix, e.g. /dev/mapper/crypt-root[/@rootfs]
+    ROOT_SRC="${ROOT_SRC%%\[*}"
+    [[ -n "$ROOT_SRC" ]] || die "cannot determine the source device for /"
+fi
+
+CHAIN_NAME=()
+CHAIN_TYPE=()
+CHAIN_FSTYPE=()
+CHAIN_UUID=()
+while read -r _name _type _fstype _uuid; do
+    [[ -n "$_name" ]] || continue
+    CHAIN_NAME+=("$_name")
+    CHAIN_TYPE+=("${_type:-}")
+    CHAIN_FSTYPE+=("${_fstype:-}")
+    CHAIN_UUID+=("${_uuid:-}")
+done < <(ancestry "$ROOT_SRC")
+
+[[ ${#CHAIN_NAME[@]} -gt 0 ]] || die "could not read the block-device ancestry of /"
+[[ -n "$ROOT_SRC" ]] || ROOT_SRC="${CHAIN_NAME[0]}"
+
+LUKS_DEV=""
+LUKS_UUID=""
+LUKS_INDEX=-1
+for i in "${!CHAIN_NAME[@]}"; do
+    if [[ "${CHAIN_FSTYPE[$i]}" == "crypto_LUKS" ]]; then
+        LUKS_DEV="${CHAIN_NAME[$i]}"
+        LUKS_UUID="${CHAIN_UUID[$i]}"
+        LUKS_INDEX=$i
+        break
+    fi
+done
+
+if [[ -z "$LUKS_DEV" ]]; then
+    die "/ is not on a LUKS volume (no crypto_LUKS parent of $ROOT_SRC) — nothing to do"
+fi
+
+# The crypt mapping in our chain: the `crypt` row nearest the LUKS partition.
+MAP_NAME=""
+for (( i = LUKS_INDEX - 1; i >= 0; i-- )); do
+    if [[ "${CHAIN_TYPE[$i]}" == "crypt" ]]; then
+        MAP_NAME=$(basename "${CHAIN_NAME[$i]}")
+        break
+    fi
+done
+
+# An LVM layer between LUKS and / needs its VG named on the cmdline, otherwise
+# a non-hostonly initramfs will not activate it.
+VG_NAME=""
+for (( i = LUKS_INDEX - 1; i >= 0; i-- )); do
+    if [[ "${CHAIN_TYPE[$i]}" == "lvm" ]]; then
+        if [[ -z "$LSBLK_FIXTURE" ]]; then
+            VG_NAME=$(lvs --noheadings -o vg_name "${CHAIN_NAME[$i]}" 2>/dev/null \
+                      | tr -d '[:space:]' || true)
+        fi
+        # Fall back to the dm name convention <vg>-<lv> when lvs is unavailable.
+        if [[ -z "$VG_NAME" ]]; then
+            _dm=$(basename "${CHAIN_NAME[$i]}")
+            VG_NAME="${_dm%%-*}"
+        fi
+        break
+    fi
+done
+
+[[ -n "$OPT_NAME" ]] && MAP_NAME="$OPT_NAME"
+[[ -n "$OPT_UUID" ]] && LUKS_UUID="$OPT_UUID"
+
+[[ -n "$MAP_NAME" ]]  || die "cannot determine the crypt mapping name for $LUKS_DEV (pass --name)"
+[[ -n "$LUKS_UUID" ]] || die "cannot read the LUKS UUID of $LUKS_DEV (pass --uuid)"
+
+if [[ -z "$LSBLK_FIXTURE" ]] && command -v cryptsetup >/dev/null 2>&1; then
+    cryptsetup isLuks "$LUKS_DEV" || die "$LUKS_DEV does not look like a LUKS container"
+fi
+
+LUKS_PARAMS="rd.luks.uuid=${LUKS_UUID} rd.luks.name=${LUKS_UUID}=${MAP_NAME}"
+[[ -n "$VG_NAME" ]] && LUKS_PARAMS="${LUKS_PARAMS} rd.lvm.vg=${VG_NAME}"
+
+cat << SUMMARY
+
+  root device      ${ROOT_SRC}
+  LUKS container   ${LUKS_DEV}
+  LUKS UUID        ${LUKS_UUID}
+  mapping name     ${MAP_NAME}
+  LVM volume group ${VG_NAME:-(none)}
+
+  kernel parameters to be added:
+      ${LUKS_PARAMS}
+
+SUMMARY
+
+if [[ -n "$LSBLK_FIXTURE" ]]; then
+    info "fixture mode — discovery only, exiting"
+    exit 0
+fi
+
+# ── Confirm ───────────────────────────────────────────────────────────
+if [[ $DRY_RUN -eq 0 && $ASSUME_YES -eq 0 ]]; then
+    [[ -t 0 ]] || die "not a terminal — re-run with --yes (or --dry-run first)"
+    read -r -p "Rebuild this system's initramfs with dracut using the above? [y/N] " _reply
+    case "$_reply" in
+        y|Y|yes|YES) ;;
+        *) die "aborted" ;;
+    esac
+fi
+
+# ── File / command helpers ────────────────────────────────────────────
+backup() {
+    local path="$1" dest="$1.dracut-luks-${STAMP}.bak"
+    cp -a "$path" "$dest"
+    info "backed up: $path -> $dest"
+}
+
+# Reads the desired content on stdin. No-op when the file already matches.
+write_file() {
+    local path="$1" mode="$2" tmp
+    tmp=$(mktemp)
+    cat > "$tmp"
+    if [[ -e "$path" ]] && cmp -s "$tmp" "$path"; then
+        info "unchanged: $path"
+        rm -f "$tmp"
+        return 0
+    fi
+    if [[ $DRY_RUN -eq 1 ]]; then
+        info "would write: $path (mode $mode)"
+        if [[ -e "$path" ]]; then
+            diff -u "$path" "$tmp" | sed 's/^/    /' || true
+        else
+            sed 's/^/    + /' "$tmp"
+        fi
+        rm -f "$tmp"
+        return 0
+    fi
+    if [[ -e "$path" ]]; then
+        backup "$path"
+    fi
+    mkdir -p "$(dirname "$path")"
+    install -m "$mode" "$tmp" "$path"
+    rm -f "$tmp"
+    info "wrote: $path"
+}
+
+run() {
+    if [[ $DRY_RUN -eq 1 ]]; then
+        info "would run: $*"
+        return 0
+    fi
+    info "running: $*"
+    "$@"
+}
+
+# ── /etc/crypttab ─────────────────────────────────────────────────────
+# Append-only: an existing entry for this container is left exactly as the
+# admin wrote it (it may carry a keyfile or options we must not clobber).
+CRYPTTAB_LINE="${MAP_NAME}  UUID=${LUKS_UUID}  none  luks,discard"
+
+if [[ -f "$CRYPTTAB" ]] && grep -qE "^[^#[:space:]]+[[:space:]]+(UUID=${LUKS_UUID}|${LUKS_DEV})([[:space:]]|$)" "$CRYPTTAB"; then
+    info "crypttab already has an entry for ${LUKS_UUID} — leaving it alone"
+elif [[ $DRY_RUN -eq 1 ]]; then
+    info "would append to $CRYPTTAB:"
+    echo "    + $CRYPTTAB_LINE"
+else
+    if [[ -f "$CRYPTTAB" ]]; then
+        backup "$CRYPTTAB"
+    else
+        printf '# <target name>  <source device>  <key file>  <options>\n' > "$CRYPTTAB"
+        chmod 0644 "$CRYPTTAB"
+    fi
+    printf '%s\n' "$CRYPTTAB_LINE" >> "$CRYPTTAB"
+    info "appended to $CRYPTTAB: $CRYPTTAB_LINE"
+fi
+
+# ── /etc/dracut.conf.d/luks.conf ──────────────────────────────────────
+# hostonly_cmdline=no keeps the GRUB command line authoritative instead of
+# baking the unlock parameters into the initramfs, so a later UUID change is
+# fixed by editing the drop-in and running update-grub.
+write_file "$DRACUT_CONF" 0644 << 'DRACUTCONF'
+# /etc/dracut.conf.d/luks.conf — generated by dracut-luks-setup
+#
+# Unlock the LUKS root at boot. The unlock parameters themselves live on the
+# kernel command line (/etc/default/grub.d/dracut-luks.cfg), not in here.
+add_dracutmodules+=" crypt dm rootfs-block "
+hostonly="yes"
+hostonly_cmdline="no"
+DRACUTCONF
+
+# ── /etc/default/grub.d/dracut-luks.cfg ───────────────────────────────
+# Appending to GRUB_CMDLINE_LINUX means the stock 10_linux entries pick the
+# parameters up; no custom entry generator is needed. Skip if the admin has
+# already set rd.luks.uuid= somewhere else, which would otherwise create a
+# second, conflicting unlock mapping.
+EXISTING_LUKS_CMDLINE=""
+for _f in /etc/default/grub /etc/default/grub.d/*.cfg; do
+    [[ -r "$_f" ]] || continue
+    [[ "$_f" == "$GRUB_DROPIN" ]] && continue
+    if grep -q "rd\.luks\.uuid=" "$_f"; then
+        EXISTING_LUKS_CMDLINE="$_f"
+        break
+    fi
+done
+
+if [[ -n "$EXISTING_LUKS_CMDLINE" ]]; then
+    warn "rd.luks.uuid= is already set in $EXISTING_LUKS_CMDLINE — not writing $GRUB_DROPIN"
+    warn "  remove it there if you want this tool to manage the unlock parameters"
+else
+    write_file "$GRUB_DROPIN" 0644 << GRUBDROPIN
+# /etc/default/grub.d/dracut-luks.cfg — generated by dracut-luks-setup
+#
+# Sourced by /etc/default/grub via the grub.d mechanism, so these parameters
+# are appended to every entry grub-mkconfig generates.
+GRUB_CMDLINE_LINUX="\${GRUB_CMDLINE_LINUX:-} ${LUKS_PARAMS}"
+GRUBDROPIN
+fi
+
+# ── Packages ──────────────────────────────────────────────────────────
+if [[ $NO_INSTALL -eq 1 ]]; then
+    info "--no-install: skipping package installation"
+    command -v dracut >/dev/null 2>&1 || die "dracut is not installed and --no-install was given"
+else
+    _want=()
+    command -v cryptsetup >/dev/null 2>&1 || _want+=("cryptsetup")
+    command -v dracut     >/dev/null 2>&1 || _want+=("dracut")
+    if [[ ${#_want[@]} -gt 0 ]]; then
+        # Installing dracut removes initramfs-tools; dpkg handles the swap.
+        run env DEBIAN_FRONTEND=noninteractive apt-get install -y "${_want[@]}"
+    else
+        info "dracut and cryptsetup already installed"
+    fi
+fi
+
+# ── Preserve the initramfs-tools initrds ──────────────────────────────
+# dracut writes to the same /boot/initrd.img-<kver> paths. Keeping a copy is
+# the difference between a bad boot being annoying and being a rescue-USB job.
+for _initrd in /boot/initrd.img-*; do
+    [[ -f "$_initrd" ]] || continue
+    case "$_initrd" in *.pre-dracut) continue ;; esac
+    if [[ -f "${_initrd}.pre-dracut" ]]; then
+        info "already preserved: ${_initrd}.pre-dracut"
+    elif [[ $DRY_RUN -eq 1 ]]; then
+        info "would preserve: $_initrd -> ${_initrd}.pre-dracut"
+    else
+        cp -a "$_initrd" "${_initrd}.pre-dracut"
+        info "preserved: ${_initrd}.pre-dracut"
+    fi
+done
+
+# ── Regenerate ────────────────────────────────────────────────────────
+run dracut --regenerate-all --force
+run update-grub
+
+if [[ $DRY_RUN -eq 1 ]]; then
+    info "dry run complete — nothing was changed"
+    exit 0
+fi
+
+# ── Verify ────────────────────────────────────────────────────────────
+info "verifying"
+_ok=1
+
+_kver=$(uname -r)
+if [[ -f "/boot/initrd.img-${_kver}" ]]; then
+    if lsinitrd "/boot/initrd.img-${_kver}" 2>/dev/null | grep -q "cryptsetup"; then
+        info "  initrd contains cryptsetup"
+    else
+        warn "  no cryptsetup found in /boot/initrd.img-${_kver} — the root will NOT unlock"
+        _ok=0
+    fi
+else
+    warn "  /boot/initrd.img-${_kver} not found"
+    _ok=0
+fi
+
+if grep -q "rd\.luks\.uuid=${LUKS_UUID}" /boot/grub/grub.cfg 2>/dev/null; then
+    info "  grub.cfg carries rd.luks.uuid=${LUKS_UUID}"
+else
+    warn "  no rd.luks.uuid=${LUKS_UUID} in /boot/grub/grub.cfg"
+    _ok=0
+fi
+
+if [[ $_ok -eq 1 ]]; then
+    info "done — reboot to test. Expect a dracut passphrase prompt for ${MAP_NAME}."
+else
+    warn "checks failed — see README.md 'Recovery' BEFORE rebooting"
+    exit 1
+fi

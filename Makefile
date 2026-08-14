@@ -30,6 +30,7 @@ $(SETUP): installer/freshroot-setup
 
 lint:
 	shellcheck -s bash $(SCRIPTS)
+	$(MAKE) -C dracut-luks lint
 
 clean:
 	rm -rf target

@@ -135,7 +135,20 @@ data/                                                  ← package install tree 
 installer/
   freshroot-setup                                      ← autoinstall bootstrap (shipped
                                                          separately, not inside the .deb)
+
+dracut-luks/                                           ← standalone LUKS-on-dracut tool,
+                                                         independent of freshroot
 ```
+
+## dracut-luks (standalone)
+
+[`dracut-luks/`](dracut-luks/) holds the LUKS boot logic on its own: a single
+script that switches a running Ubuntu system from initramfs-tools to dracut and
+configures it to unlock a LUKS root, with no btrfs, subvolumes or snapshots
+involved. Use it when you want dracut-based LUKS boot **without** freshroot. It
+is self-contained (own README, Makefile and tests) and shipped neither in the
+`.deb` nor in `target/`; it is an extraction by copy, so fixes there do not
+propagate here.
 
 ## Building the package
 

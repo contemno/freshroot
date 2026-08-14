@@ -1,0 +1,4 @@
+/dev/mapper/vgubuntu-root lvm ext4 9c8b7a65-3333-4d2e-9f3b-2222cafebabe
+/dev/mapper/dm_crypt-0 crypt LVM2_member 5e4d3c2b-4444-4e3f-a04c-3333badc0ffe
+/dev/nvme0n1p3 part crypto_LUKS 7a6b5c4d-5555-4f40-b15d-4444abadcafe
+/dev/nvme0n1 disk
