@@ -8,8 +8,8 @@ Standards-Version: 4.6.2
 Package: dracut-luks
 Architecture: all
 Depends: dracut, cryptsetup, grub2-common, util-linux, ${misc:Depends}
-Recommends: lvm2
-Suggests: libfido2-1, tpm2-tools
+Recommends: lvm2, tpm2-tools
+Suggests: libfido2-1
 Description: dracut configuration for unlocking a LUKS root at boot
  Installs alongside dracut on Ubuntu and makes an encrypted root boot
  without hand-editing the kernel command line.
@@ -23,8 +23,12 @@ Description: dracut configuration for unlocking a LUKS root at boot
  .
  A dracut.conf.d drop-in pulls the crypt modules into every initramfs,
  and a second one adds FIDO2 and TPM2 token support when the
- corresponding libraries are installed, so hardware-token unlock works
- without further configuration.
+ corresponding libraries are installed. Tokens enrolled in the LUKS2
+ header (systemd-cryptenroll) are detected at update-grub time and the
+ matching tpm2-device=auto / fido2-device=auto options emitted via
+ rd.luks.options, so hardware-token unlock works without further
+ configuration. TPM2 support in the initramfs needs tpm2-tools
+ installed (see Recommends).
  .
  The dracut-luks-setup helper reports what the drop-ins resolve to,
  adds a missing /etc/crypttab entry, preserves the initramfs-tools

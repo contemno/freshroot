@@ -49,11 +49,31 @@ discover() {
     )
 }
 
+# Same, for token detection against a recorded luksDump.
+tokens() {
+    local fixture="$1" var="$2"
+    (
+        set -euo pipefail
+        DL_TOKENS_FIXTURE="${FIXTURES}/${fixture}"
+        export DL_TOKENS_FIXTURE
+        # shellcheck source=../data/usr/lib/dracut-luks/discover.sh
+        . "$LIB"
+        if dracut_luks_tokens; then
+            eval "printf '%s\n' \"\$${var}\""
+        else
+            printf 'NO-TOKENS\n'
+        fi
+    )
+}
+
 # Source the GRUB drop-in exactly as grub-mkconfig does: /bin/sh, set -e,
-# with whatever the admin already had in GRUB_CMDLINE_LINUX.
+# with whatever the admin already had in GRUB_CMDLINE_LINUX. An optional
+# third argument supplies a luksDump fixture for token detection.
 grub_cmdline() {
-    local fixture="$1" preset="${2:-}"
+    local fixture="$1" preset="${2:-}" tokfixture="${3:-}"
+    [[ -n "$tokfixture" ]] && tokfixture="${FIXTURES}/${tokfixture}"
     DL_LSBLK_FIXTURE="${FIXTURES}/${fixture}" \
+    DL_TOKENS_FIXTURE="$tokfixture" \
     DL_LIB="$LIB" \
     DROPIN="$DROPIN" \
     GRUB_CMDLINE_LINUX="$preset" \
@@ -93,6 +113,15 @@ eq "map name" "$(discover luks-lvm-hyphen-vg.lsblk DL_MAP_NAME)" "luks-8b7a"
 echo "plain-ext4"
 eq "discovery declines" "$(discover plain-ext4.lsblk DL_PARAMS)" "DISCOVER-FAILED"
 
+# --- Token detection -----------------------------------------------------
+echo "tokens"
+eq "tpm2 only: types"   "$(tokens tokens-tpm2.luksdump DL_TOKENS)"     "tpm2"
+eq "tpm2 only: options" "$(tokens tokens-tpm2.luksdump DL_TOKEN_OPTS)" "tpm2-device=auto"
+eq "both: types"        "$(tokens tokens-both.luksdump DL_TOKENS)"     "tpm2 fido2"
+eq "both: options"      "$(tokens tokens-both.luksdump DL_TOKEN_OPTS)" \
+   "tpm2-device=auto,fido2-device=auto"
+eq "none: declines"     "$(tokens tokens-none.luksdump DL_TOKENS)"     "NO-TOKENS"
+
 # --- The GRUB drop-in ----------------------------------------------------
 echo "grub drop-in"
 eq "appends to empty cmdline" \
@@ -112,6 +141,24 @@ eq "defers to an admin-set rd.luks.uuid" \
 eq "unencrypted root is a no-op, not an error" \
    "$(grub_cmdline plain-ext4.lsblk 'quiet splash')" \
    "quiet splash"
+
+# Enrolled tokens must land as UUID-scoped rd.luks.options, or
+# systemd-cryptsetup skips its native token path (bogus-PIN-prompt bug).
+eq "tpm2 token adds rd.luks.options" \
+   "$(grub_cmdline luks-btrfs.lsblk '' tokens-tpm2.luksdump)" \
+   "rd.luks.uuid=${BTRFS_UUID} rd.luks.name=${BTRFS_UUID}=crypt-root rd.luks.options=${BTRFS_UUID}=tpm2-device=auto"
+
+eq "both tokens add both options" \
+   "$(grub_cmdline luks-btrfs.lsblk '' tokens-both.luksdump)" \
+   "rd.luks.uuid=${BTRFS_UUID} rd.luks.name=${BTRFS_UUID}=crypt-root rd.luks.options=${BTRFS_UUID}=tpm2-device=auto,fido2-device=auto"
+
+eq "no tokens, no rd.luks.options" \
+   "$(grub_cmdline luks-btrfs.lsblk '' tokens-none.luksdump)" \
+   "rd.luks.uuid=${BTRFS_UUID} rd.luks.name=${BTRFS_UUID}=crypt-root"
+
+eq "defers to an admin-set rd.luks.options" \
+   "$(grub_cmdline luks-btrfs.lsblk 'rd.luks.options=discard' tokens-tpm2.luksdump)" \
+   "rd.luks.options=discard rd.luks.uuid=${BTRFS_UUID} rd.luks.name=${BTRFS_UUID}=crypt-root"
 
 echo
 echo "${PASS} passed, ${FAIL} failed"

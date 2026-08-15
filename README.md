@@ -39,7 +39,10 @@ recurring work, so there is no generated configuration to go stale:
 
 - **`/etc/dracut.conf.d/20-luks-tokens.conf`** — adds the dracut `fido2` /
   `tpm2-tss` modules and the matching libcryptsetup token plugins, each only
-  when the relevant userspace library is installed, so it is safe unconditionally.
+  when the relevant userspace pieces are installed, so it is safe
+  unconditionally. The guards test for library *files*, never dpkg package
+  names — those change on ABI bumps (noble's time_t transition renamed
+  `libtss2-esys-3.0.2-0` to `libtss2-esys-3.0.2-0t64`).
 
 - **`/usr/lib/dracut-luks/discover.sh`** — the shared discovery library both
   the GRUB drop-in and the helper source. It walks the block-device ancestry of
@@ -51,6 +54,41 @@ recurring work, so there is no generated configuration to go stale:
 Because the parameters land in `GRUB_CMDLINE_LINUX`, the stock Ubuntu
 (`10_linux`) menu entries carry them — no custom GRUB entry generator, and the
 normal entries keep working.
+
+## Hardware tokens (TPM2 / FIDO2)
+
+Enroll with systemd as usual — for TPM2 bound to Secure Boot state:
+
+```bash
+sudo systemd-cryptenroll --tpm2-device=auto --tpm2-pcrs=7 /dev/<luks-partition>
+```
+
+then pick the enrollment up with `sudo dracut-luks-setup` (or manually:
+`dracut --regenerate-all --force && update-grub`). The GRUB drop-in reads the
+enrolled token types out of the LUKS2 header on every `update-grub` and emits
+
+```
+rd.luks.options=<uuid>=tpm2-device=auto[,fido2-device=auto]
+```
+
+and the helper writes the same options into new `/etc/crypttab` entries.
+Unenrolling and re-running `update-grub` removes them again.
+
+Those options matter more than they look: they put `systemd-cryptsetup` on its
+**native** token path, which reads the token's own PIN flag. Without them,
+unlock goes through the generic libcryptsetup plugin path, where a token
+plugin that cannot reach the TPM (typically because the tss libraries or TPM
+drivers are missing from the initramfs) misreports as *"token needs PIN"* —
+you get a PIN prompt for a token that was enrolled without one, and no PIN is
+accepted. The crypttab option is also what makes dracut pull the `tpm2-tss` /
+`fido2` modules into the initramfs on its own.
+
+TPM2 support in the initramfs requires `tpm2-tools` on the host (dracut's
+`tpm2-tss` module refuses to build into the image without the `tpm2` binary);
+it is a `Recommends:` of this package. FIDO2 requires `libfido2-1`.
+`dracut-luks-setup --check` verifies the whole chain: token enrolled →
+crypttab option present → plugin in the initrd → `rd.luks.options` in
+`grub.cfg`.
 
 Note that installing dracut on Ubuntu **removes initramfs-tools** (they
 conflict); that swap is the point of the package, but it is worth knowing
@@ -68,9 +106,12 @@ sudo dracut-luks-setup           # crypttab + preserve initrds + regenerate + ve
 
 A mutating run:
 
-1. Adds an `/etc/crypttab` entry (`<name> UUID=<uuid> none luks,discard`) if
-   none exists for the container. An existing entry is never touched — it may
-   carry a keyfile or token options that must not be clobbered.
+1. Adds an `/etc/crypttab` entry if none exists for the container:
+   `<name> UUID=<uuid> none luks,discard[,tpm2-device=auto][,fido2-device=auto]`
+   per the tokens enrolled in the LUKS2 header. An existing entry is never
+   touched — it may carry a keyfile or options that must not be clobbered —
+   but the helper warns when it lacks a `*-device=` option for an enrolled
+   token.
 2. Preserves each `/boot/initrd.img-<kver>` as `<file>.pre-dracut` before
    dracut overwrites it.
 3. Runs `dracut --regenerate-all --force` and `update-grub`.

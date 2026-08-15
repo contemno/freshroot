@@ -1,0 +1,8 @@
+LUKS header information
+Version:        2
+Epoch:          3
+UUID:           a1b2c3d4-2222-4c1f-8e2a-1111feedface
+
+Tokens:
+Keyslots:
+  0: luks2

@@ -51,9 +51,10 @@ while [[ $# -gt 0 ]]; do
         --no-regenerate)  NO_REGENERATE=1 ;;
         --name)           OPT_NAME="${2:-}"; shift ;;
         --uuid)           OPT_UUID="${2:-}"; shift ;;
-        # Testing hook: read the block-device ancestry from a recorded
-        # `lsblk -nPspo` capture instead of probing. Implies --check.
+        # Testing hooks: read the block-device ancestry / LUKS header dump
+        # from recorded captures instead of probing. Imply --check.
         --lsblk-fixture)  export DL_LSBLK_FIXTURE="${2:-}"; CHECK_ONLY=1; shift ;;
+        --tokens-fixture) export DL_TOKENS_FIXTURE="${2:-}"; CHECK_ONLY=1; shift ;;
         --help|-h)        usage ;;
         *)                die "unknown argument: $1 (try --help)" ;;
     esac
@@ -77,6 +78,7 @@ fi
 
 DL_ROOT_SRC=""; DL_LUKS_DEV=""; DL_LUKS_UUID=""
 DL_MAP_NAME=""; DL_VG_NAME=""; DL_PARAMS=""
+DL_TOKENS=""; DL_TOKEN_OPTS=""
 
 if ! dracut_luks_discover; then
     die "/ is not on a LUKS volume — nothing for dracut-luks to do"
@@ -89,6 +91,13 @@ if [[ -n "$OPT_NAME" || -n "$OPT_UUID" ]]; then
     [[ -n "$DL_VG_NAME" ]] && DL_PARAMS="${DL_PARAMS} rd.lvm.vg=${DL_VG_NAME}"
 fi
 
+# Enrolled TPM2/FIDO2 tokens change both the cmdline and the crypttab
+# options. Non-fatal: no tokens just means passphrase unlock.
+dracut_luks_tokens || true
+if [[ -n "$DL_TOKEN_OPTS" ]]; then
+    DL_PARAMS="${DL_PARAMS} rd.luks.options=${DL_LUKS_UUID}=${DL_TOKEN_OPTS}"
+fi
+
 cat << SUMMARY
 
   root device      ${DL_ROOT_SRC}
@@ -96,6 +105,7 @@ cat << SUMMARY
   LUKS UUID        ${DL_LUKS_UUID}
   mapping name     ${DL_MAP_NAME:-(none)}
   LVM volume group ${DL_VG_NAME:-(none)}
+  enrolled tokens  ${DL_TOKENS:-(none)}
 
   kernel parameters update-grub will add:
       ${DL_PARAMS}
@@ -129,6 +139,22 @@ check_state() {
         rc=1
     fi
 
+    # An entry for the container that lacks the *-device= option for an
+    # enrolled token breaks two things: systemd-cryptsetup skips its native
+    # token path (the generic plugin path can invent a PIN prompt for a
+    # token enrolled without one), and dracut's 90crypt no longer pulls the
+    # tpm2-tss/fido2 modules into the initramfs.
+    local tok opt
+    for tok in $DL_TOKENS; do
+        opt="${tok}-device="
+        if crypttab_has_entry && ! crypttab_entry_has "$opt"; then
+            report 1 "${tok} token enrolled but crypttab entry lacks ${opt}auto"
+            rc=1
+        elif crypttab_has_entry; then
+            report 0 "crypttab entry carries ${opt}auto"
+        fi
+    done
+
     local kver initrd
     kver=$(uname -r)
     initrd="/boot/initrd.img-${kver}"
@@ -139,11 +165,36 @@ check_state() {
         rc=1
     fi
 
+    # Token unlock needs the plugin AND its libraries inside the initramfs.
+    for tok in $DL_TOKENS; do
+        local want=""
+        case "$tok" in
+            tpm2)  want="libcryptsetup-token-systemd-tpm2.so" ;;
+            fido2) want="libcryptsetup-token-systemd-fido2.so" ;;
+        esac
+        [[ -n "$want" ]] || continue
+        if [[ -f "$initrd" ]] && lsinitrd "$initrd" 2>/dev/null | grep -q "$want"; then
+            report 0 "${want} present in initrd"
+        else
+            report 1 "${tok} token enrolled but ${want} missing from initrd"
+            rc=1
+        fi
+    done
+
     if grep -q "rd\.luks\.uuid=${DL_LUKS_UUID}" /boot/grub/grub.cfg 2>/dev/null; then
         report 0 "rd.luks.uuid=${DL_LUKS_UUID} in /boot/grub/grub.cfg"
     else
         report 1 "rd.luks.uuid=${DL_LUKS_UUID} in /boot/grub/grub.cfg"
         rc=1
+    fi
+
+    if [[ -n "$DL_TOKEN_OPTS" ]]; then
+        if grep -q "rd\.luks\.options=${DL_LUKS_UUID}=" /boot/grub/grub.cfg 2>/dev/null; then
+            report 0 "rd.luks.options for ${DL_LUKS_UUID} in /boot/grub/grub.cfg"
+        else
+            report 1 "tokens enrolled but no rd.luks.options=${DL_LUKS_UUID}=... in grub.cfg"
+            rc=1
+        fi
     fi
 
     return $rc
@@ -153,6 +204,14 @@ crypttab_has_entry() {
     [[ -f "$CRYPTTAB" ]] || return 1
     grep -qE "^[^#[:space:]]+[[:space:]]+(UUID=${DL_LUKS_UUID}|${DL_LUKS_DEV})([[:space:]]|$)" \
         "$CRYPTTAB"
+}
+
+# Does the container's crypttab entry carry the given option (e.g.
+# tpm2-device=)? Only looks at the entry for OUR container.
+crypttab_entry_has() {
+    [[ -f "$CRYPTTAB" ]] || return 1
+    grep -E "^[^#[:space:]]+[[:space:]]+(UUID=${DL_LUKS_UUID}|${DL_LUKS_DEV})([[:space:]]|$)" \
+        "$CRYPTTAB" | grep -q "$1"
 }
 
 if [[ $CHECK_ONLY -eq 1 ]]; then
@@ -189,13 +248,24 @@ run() {
 
 # /etc/crypttab — append-only. An existing entry is left exactly as the admin
 # wrote it; it may carry a keyfile or token options that must not be clobbered.
+# The *-device= options make dracut's 90crypt pull the tpm2-tss/fido2 modules
+# into every initramfs, and put systemd-cryptsetup on its native token path.
+CRYPTTAB_OPTS="luks,discard${DL_TOKEN_OPTS:+,${DL_TOKEN_OPTS}}"
+
 if crypttab_has_entry; then
     info "crypttab already has an entry for ${DL_LUKS_UUID} — leaving it alone"
+    for _tok in $DL_TOKENS; do
+        if ! crypttab_entry_has "${_tok}-device="; then
+            warn "the entry lacks ${_tok}-device=auto although a ${_tok} token is enrolled —"
+            warn "  add it to the entry's options column in $CRYPTTAB, or the initramfs"
+            warn "  will miss the ${_tok} unlock support and may prompt for a bogus PIN"
+        fi
+    done
 elif [[ -z "$DL_MAP_NAME" ]]; then
     warn "no crypttab entry for ${DL_LUKS_UUID} and no mapping name to create one with"
     warn "  re-run with --name <name>"
 else
-    CRYPTTAB_LINE="${DL_MAP_NAME}  UUID=${DL_LUKS_UUID}  none  luks,discard"
+    CRYPTTAB_LINE="${DL_MAP_NAME}  UUID=${DL_LUKS_UUID}  none  ${CRYPTTAB_OPTS}"
     if [[ $DRY_RUN -eq 1 ]]; then
         info "would append to $CRYPTTAB:"
         echo "    + $CRYPTTAB_LINE"

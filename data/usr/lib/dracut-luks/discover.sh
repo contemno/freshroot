@@ -19,6 +19,9 @@
 # On success sets: DL_ROOT_SRC DL_LUKS_DEV DL_LUKS_UUID DL_MAP_NAME
 #                  DL_VG_NAME DL_PARAMS
 # Returns non-zero (with all of them empty) when / is not on LUKS.
+#
+# dracut_luks_tokens (call after a successful discover) additionally sets
+# DL_TOKENS and DL_TOKEN_OPTS from the LUKS2 header's enrolled tokens.
 
 # Recover a volume-group name from a device-mapper name. dm escapes '-' in
 # VG and LV names as '--', so vgubuntu-root -> vgubuntu but my--vg-root ->
@@ -125,4 +128,47 @@ dracut_luks_discover() {
     fi
 
     return 0
+}
+
+# Detect the token types enrolled in the LUKS2 header (systemd-cryptenroll
+# records them as "systemd-tpm2" / "systemd-fido2"). This is what should
+# drive the unlock configuration: with tpm2-device=auto / fido2-device=auto
+# present, systemd-cryptsetup takes its NATIVE token path — which reads the
+# token's own pin flag and never invents a PIN prompt — and dracut's 90crypt
+# pulls the tpm2-tss/fido2 modules in via /etc/crypttab. Without them, unlock
+# falls through the generic libcryptsetup plugin path, where an unreachable
+# TPM surfaces as "token needs PIN" even though none was enrolled.
+#
+# Call AFTER a successful dracut_luks_discover, and always from a condition
+# (same set -e rule as above). Degrades to empty on permission denied, no
+# cryptsetup, or a LUKS1 header — token unlock simply isn't configured then.
+#
+# Sets: DL_TOKENS     space-separated token types, e.g. "tpm2 fido2"
+#       DL_TOKEN_OPTS matching crypttab options, e.g. "tpm2-device=auto"
+#                     (comma-separated when both are enrolled)
+dracut_luks_tokens() {
+    DL_TOKENS=''
+    DL_TOKEN_OPTS=''
+
+    _dl_dump=''
+    if [ -n "${DL_TOKENS_FIXTURE:-}" ]; then
+        [ -r "$DL_TOKENS_FIXTURE" ] || return 1
+        _dl_dump=$(cat "$DL_TOKENS_FIXTURE" 2>/dev/null)
+    else
+        [ -n "${DL_LUKS_DEV:-}" ] || return 1
+        command -v cryptsetup >/dev/null 2>&1 || return 1
+        _dl_dump=$(cryptsetup luksDump "$DL_LUKS_DEV" 2>/dev/null)
+    fi
+    [ -n "$_dl_dump" ] || return 1
+
+    if printf '%s\n' "$_dl_dump" | grep -q 'systemd-tpm2'; then
+        DL_TOKENS='tpm2'
+        DL_TOKEN_OPTS='tpm2-device=auto'
+    fi
+    if printf '%s\n' "$_dl_dump" | grep -q 'systemd-fido2'; then
+        DL_TOKENS="${DL_TOKENS:+${DL_TOKENS} }fido2"
+        DL_TOKEN_OPTS="${DL_TOKEN_OPTS:+${DL_TOKEN_OPTS},}fido2-device=auto"
+    fi
+
+    [ -n "$DL_TOKENS" ]
 }

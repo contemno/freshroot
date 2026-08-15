@@ -1,3 +1,22 @@
+dracut-luks (0.1.1) UNRELEASED; urgency=medium
+
+  * Fix bogus TPM2 PIN prompt at boot for tokens enrolled without a PIN.
+    Enrolled LUKS2 tokens (systemd-tpm2 / systemd-fido2) are now detected
+    at update-grub time and emitted as UUID-scoped rd.luks.options
+    (tpm2-device=auto / fido2-device=auto), putting systemd-cryptsetup on
+    its native token path; new crypttab entries carry the same options so
+    dracut pulls the tpm2-tss/fido2 modules into the initramfs itself.
+  * 20-luks-tokens.conf: gate on library files instead of dpkg package
+    names (the t64 ABI rename made libtss2-esys undetectable on noble,
+    leaving TPM support out of the initramfs), and require the tpm2
+    binary before adding the tpm2-tss module (its check() hard-fails the
+    initramfs build without tpm2-tools).
+  * Recommend tpm2-tools; dracut-luks-setup --check now verifies the
+    token chain (crypttab option, plugin in initrd, rd.luks.options in
+    grub.cfg).
+
+ -- Joshua Miller <freshroot@lamille.net>  Fri, 15 Aug 2026 01:00:00 +0000
+
 dracut-luks (0.1.0) UNRELEASED; urgency=medium
 
   * Initial release. GRUB drop-in that derives rd.luks.* at update-grub

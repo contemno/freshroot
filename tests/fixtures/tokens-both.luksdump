@@ -1,0 +1,16 @@
+LUKS header information
+Version:        2
+Epoch:          14
+UUID:           a1b2c3d4-2222-4c1f-8e2a-1111feedface
+
+Tokens:
+  0: systemd-tpm2
+	tpm2-pin:         false
+	Keyslot:          1
+  1: systemd-fido2
+	fido2-rp:         io.systemd.cryptsetup
+	Keyslot:          2
+Keyslots:
+  0: luks2
+  1: luks2
+  2: luks2
