@@ -1,0 +1,2 @@
+NAME="/dev/vda2" TYPE="part" FSTYPE="ext4" UUID="2b1a0918-6666-4051-c26e-5555f00dfeed"
+NAME="/dev/vda" TYPE="disk" FSTYPE="" UUID=""

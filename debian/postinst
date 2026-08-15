@@ -1,0 +1,28 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    configure)
+        # Pull the crypt/token modules into the images and put the freshly
+        # derived rd.luks.* parameters on the command line. Failures here are
+        # reported but do not fail the install: the box may be a container or
+        # an image build with no /boot to write to, and leaving the package
+        # half-configured would be worse than a warning.
+        if command -v dracut >/dev/null 2>&1; then
+            dracut --regenerate-all --force \
+                || echo "dracut-luks: WARNING: dracut --regenerate-all failed" >&2
+        fi
+
+        if [ -d /boot/grub ] && command -v update-grub >/dev/null 2>&1; then
+            update-grub \
+                || echo "dracut-luks: WARNING: update-grub failed" >&2
+        fi
+
+        # Say what actually happened rather than assuming it worked.
+        if command -v dracut-luks-setup >/dev/null 2>&1; then
+            dracut-luks-setup --check || true
+        fi
+        ;;
+esac
+
+#DEBHELPER#

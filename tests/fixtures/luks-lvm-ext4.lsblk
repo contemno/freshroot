@@ -1,0 +1,4 @@
+NAME="/dev/mapper/vgubuntu-root" TYPE="lvm" FSTYPE="ext4" UUID="9c8b7a65-3333-4d2e-9f3b-2222cafebabe"
+NAME="/dev/mapper/dm_crypt-0" TYPE="crypt" FSTYPE="LVM2_member" UUID="5e4d3c2b-4444-4e3f-a04c-3333badc0ffe"
+NAME="/dev/nvme0n1p3" TYPE="part" FSTYPE="crypto_LUKS" UUID="7a6b5c4d-5555-4f40-b15d-4444abadcafe"
+NAME="/dev/nvme0n1" TYPE="disk" FSTYPE="" UUID=""

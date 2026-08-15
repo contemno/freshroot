@@ -1,0 +1,255 @@
+#!/bin/bash
+# /usr/sbin/dracut-luks-setup
+#
+# Companion tool for the dracut-luks package. The package's conffiles already
+# do the recurring work — /etc/default/grub.d/99-dracut-luks.cfg adds the
+# rd.luks.* parameters on every update-grub, /etc/dracut.conf.d/*.conf pull the
+# unlock modules into every initramfs — so this handles the one-time and
+# diagnostic parts:
+#
+#   * show what the conffiles will resolve to on this machine
+#   * add an /etc/crypttab entry for the root container if one is missing
+#   * preserve the initramfs-tools initrds before dracut overwrites them
+#   * regenerate the initramfs and grub.cfg, then verify the result
+#
+# Usage:
+#   dracut-luks-setup --check                 read-only; discovery + verification
+#   sudo dracut-luks-setup [--dry-run] [--yes] [--no-regenerate]
+#                          [--name NAME] [--uuid UUID]
+
+set -euo pipefail
+
+PROGNAME="dracut-luks-setup"
+STAMP=$(date -u +%Y%m%dT%H%M%S)
+
+CRYPTTAB="/etc/crypttab"
+GRUB_DROPIN="/etc/default/grub.d/99-dracut-luks.cfg"
+DRACUT_CONF="/etc/dracut.conf.d/10-luks.conf"
+
+die()  { echo "FATAL: $*" >&2; exit 1; }
+info() { echo "[$PROGNAME] $*"; }
+warn() { echo "[$PROGNAME] WARNING: $*" >&2; }
+
+usage() {
+    sed -n '3,23p' "$0" | sed 's/^# \{0,1\}//'
+    exit 0
+}
+
+# ── Arguments ─────────────────────────────────────────────────────────
+DRY_RUN=0
+CHECK_ONLY=0
+ASSUME_YES=0
+NO_REGENERATE=0
+OPT_NAME=""
+OPT_UUID=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --check)          CHECK_ONLY=1 ;;
+        --dry-run)        DRY_RUN=1 ;;
+        --yes|-y)         ASSUME_YES=1 ;;
+        --no-regenerate)  NO_REGENERATE=1 ;;
+        --name)           OPT_NAME="${2:-}"; shift ;;
+        --uuid)           OPT_UUID="${2:-}"; shift ;;
+        # Testing hook: read the block-device ancestry from a recorded
+        # `lsblk -nPspo` capture instead of probing. Implies --check.
+        --lsblk-fixture)  export DL_LSBLK_FIXTURE="${2:-}"; CHECK_ONLY=1; shift ;;
+        --help|-h)        usage ;;
+        *)                die "unknown argument: $1 (try --help)" ;;
+    esac
+    shift
+done
+
+# ── Shared discovery ──────────────────────────────────────────────────
+# Same library the GRUB drop-in sources, so what this prints is what
+# update-grub will actually put on the command line.
+DL_LIB="${DL_LIB:-/usr/lib/dracut-luks/discover.sh}"
+if [[ ! -r "$DL_LIB" ]]; then
+    _here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+    # /usr/sbin/.. -> /usr/lib, and data/usr/sbin/.. -> data/usr/lib
+    if [[ -r "${_here}/../lib/dracut-luks/discover.sh" ]]; then
+        DL_LIB="${_here}/../lib/dracut-luks/discover.sh"
+    fi
+fi
+[[ -r "$DL_LIB" ]] || die "cannot find discover.sh (looked at $DL_LIB)"
+# shellcheck source=../lib/dracut-luks/discover.sh
+. "$DL_LIB"
+
+DL_ROOT_SRC=""; DL_LUKS_DEV=""; DL_LUKS_UUID=""
+DL_MAP_NAME=""; DL_VG_NAME=""; DL_PARAMS=""
+
+if ! dracut_luks_discover; then
+    die "/ is not on a LUKS volume — nothing for dracut-luks to do"
+fi
+
+[[ -n "$OPT_NAME" ]] && DL_MAP_NAME="$OPT_NAME"
+[[ -n "$OPT_UUID" ]] && DL_LUKS_UUID="$OPT_UUID"
+if [[ -n "$OPT_NAME" || -n "$OPT_UUID" ]]; then
+    DL_PARAMS="rd.luks.uuid=${DL_LUKS_UUID} rd.luks.name=${DL_LUKS_UUID}=${DL_MAP_NAME}"
+    [[ -n "$DL_VG_NAME" ]] && DL_PARAMS="${DL_PARAMS} rd.lvm.vg=${DL_VG_NAME}"
+fi
+
+cat << SUMMARY
+
+  root device      ${DL_ROOT_SRC}
+  LUKS container   ${DL_LUKS_DEV}
+  LUKS UUID        ${DL_LUKS_UUID}
+  mapping name     ${DL_MAP_NAME:-(none)}
+  LVM volume group ${DL_VG_NAME:-(none)}
+
+  kernel parameters update-grub will add:
+      ${DL_PARAMS}
+
+SUMMARY
+
+# ── Read-only checks ──────────────────────────────────────────────────
+report() {
+    local ok=$1 msg=$2
+    if [[ $ok -eq 0 ]]; then
+        echo "  ok    $msg"
+    else
+        echo "  MISS  $msg"
+    fi
+    return 0
+}
+
+check_state() {
+    local rc=0
+    echo "package state"
+    if [[ -r "$GRUB_DROPIN" ]]; then report 0 "$GRUB_DROPIN"; else report 1 "$GRUB_DROPIN"; rc=1; fi
+    if [[ -r "$DRACUT_CONF" ]]; then report 0 "$DRACUT_CONF"; else report 1 "$DRACUT_CONF"; rc=1; fi
+    if command -v dracut >/dev/null 2>&1; then report 0 "dracut installed"; else report 1 "dracut installed"; rc=1; fi
+    if command -v cryptsetup >/dev/null 2>&1; then report 0 "cryptsetup installed"; else report 1 "cryptsetup installed"; rc=1; fi
+
+    echo "system state"
+    if crypttab_has_entry; then
+        report 0 "$CRYPTTAB entry for ${DL_LUKS_UUID}"
+    else
+        report 1 "$CRYPTTAB entry for ${DL_LUKS_UUID}"
+        rc=1
+    fi
+
+    local kver initrd
+    kver=$(uname -r)
+    initrd="/boot/initrd.img-${kver}"
+    if [[ -f "$initrd" ]] && lsinitrd "$initrd" 2>/dev/null | grep -q cryptsetup; then
+        report 0 "cryptsetup present in $initrd"
+    else
+        report 1 "cryptsetup present in $initrd"
+        rc=1
+    fi
+
+    if grep -q "rd\.luks\.uuid=${DL_LUKS_UUID}" /boot/grub/grub.cfg 2>/dev/null; then
+        report 0 "rd.luks.uuid=${DL_LUKS_UUID} in /boot/grub/grub.cfg"
+    else
+        report 1 "rd.luks.uuid=${DL_LUKS_UUID} in /boot/grub/grub.cfg"
+        rc=1
+    fi
+
+    return $rc
+}
+
+crypttab_has_entry() {
+    [[ -f "$CRYPTTAB" ]] || return 1
+    grep -qE "^[^#[:space:]]+[[:space:]]+(UUID=${DL_LUKS_UUID}|${DL_LUKS_DEV})([[:space:]]|$)" \
+        "$CRYPTTAB"
+}
+
+if [[ $CHECK_ONLY -eq 1 ]]; then
+    if check_state; then
+        echo
+        info "all checks passed"
+        exit 0
+    fi
+    echo
+    warn "some checks failed — run 'sudo $PROGNAME' to fix what is fixable"
+    exit 1
+fi
+
+# ── Mutating run ──────────────────────────────────────────────────────
+[[ $EUID -eq 0 ]] || die "must run as root (or use --check)"
+
+if [[ $DRY_RUN -eq 0 && $ASSUME_YES -eq 0 ]]; then
+    [[ -t 0 ]] || die "not a terminal — re-run with --yes (or --dry-run first)"
+    read -r -p "Rebuild this system's initramfs and grub.cfg using the above? [y/N] " _reply
+    case "$_reply" in
+        y|Y|yes|YES) ;;
+        *) die "aborted" ;;
+    esac
+fi
+
+run() {
+    if [[ $DRY_RUN -eq 1 ]]; then
+        info "would run: $*"
+        return 0
+    fi
+    info "running: $*"
+    "$@"
+}
+
+# /etc/crypttab — append-only. An existing entry is left exactly as the admin
+# wrote it; it may carry a keyfile or token options that must not be clobbered.
+if crypttab_has_entry; then
+    info "crypttab already has an entry for ${DL_LUKS_UUID} — leaving it alone"
+elif [[ -z "$DL_MAP_NAME" ]]; then
+    warn "no crypttab entry for ${DL_LUKS_UUID} and no mapping name to create one with"
+    warn "  re-run with --name <name>"
+else
+    CRYPTTAB_LINE="${DL_MAP_NAME}  UUID=${DL_LUKS_UUID}  none  luks,discard"
+    if [[ $DRY_RUN -eq 1 ]]; then
+        info "would append to $CRYPTTAB:"
+        echo "    + $CRYPTTAB_LINE"
+    else
+        if [[ -f "$CRYPTTAB" ]]; then
+            cp -a "$CRYPTTAB" "${CRYPTTAB}.dracut-luks-${STAMP}.bak"
+            info "backed up: ${CRYPTTAB}.dracut-luks-${STAMP}.bak"
+        else
+            printf '# <target name>  <source device>  <key file>  <options>\n' > "$CRYPTTAB"
+            chmod 0644 "$CRYPTTAB"
+        fi
+        printf '%s\n' "$CRYPTTAB_LINE" >> "$CRYPTTAB"
+        info "appended to $CRYPTTAB: $CRYPTTAB_LINE"
+    fi
+fi
+
+# Preserve the initramfs-tools images. dracut writes to the same
+# /boot/initrd.img-<kver> paths, and a kept copy is the difference between a
+# bad boot being annoying and being a rescue-USB job.
+for _initrd in /boot/initrd.img-*; do
+    [[ -f "$_initrd" ]] || continue
+    case "$_initrd" in *.pre-dracut) continue ;; esac
+    if [[ -f "${_initrd}.pre-dracut" ]]; then
+        info "already preserved: ${_initrd}.pre-dracut"
+    elif [[ $DRY_RUN -eq 1 ]]; then
+        info "would preserve: $_initrd -> ${_initrd}.pre-dracut"
+    else
+        cp -a "$_initrd" "${_initrd}.pre-dracut"
+        info "preserved: ${_initrd}.pre-dracut"
+    fi
+done
+
+if [[ $NO_REGENERATE -eq 1 ]]; then
+    info "--no-regenerate: skipping dracut and update-grub"
+else
+    run dracut --regenerate-all --force
+    run update-grub
+fi
+
+if [[ $DRY_RUN -eq 1 ]]; then
+    echo
+    info "dry run complete — nothing was changed"
+    exit 0
+fi
+
+echo
+if check_state; then
+    echo
+    info "done — reboot to test."
+    if [[ -n "$DL_MAP_NAME" ]]; then
+        info "Expect a dracut passphrase prompt for ${DL_MAP_NAME}."
+    fi
+else
+    echo
+    warn "checks failed — read 'Recovery' in /usr/share/doc/dracut-luks/ BEFORE rebooting"
+    exit 1
+fi

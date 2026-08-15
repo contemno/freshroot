@@ -1,0 +1,19 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    remove)
+        # The drop-in is gone, so grub.cfg must be regenerated to match --
+        # otherwise it keeps advertising parameters nothing maintains any
+        # more. That does mean the entries lose rd.luks.*, hence the warning.
+        if [ -d /boot/grub ] && command -v update-grub >/dev/null 2>&1; then
+            echo "dracut-luks: regenerating grub.cfg WITHOUT rd.luks.* parameters." >&2
+            echo "dracut-luks: if / is on LUKS, add them to GRUB_CMDLINE_LINUX in" >&2
+            echo "dracut-luks: /etc/default/grub before rebooting." >&2
+            update-grub \
+                || echo "dracut-luks: WARNING: update-grub failed" >&2
+        fi
+        ;;
+esac
+
+#DEBHELPER#

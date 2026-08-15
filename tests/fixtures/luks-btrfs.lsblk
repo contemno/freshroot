@@ -1,0 +1,3 @@
+NAME="/dev/mapper/crypt-root" TYPE="crypt" FSTYPE="btrfs" UUID="4f2a1c66-1111-4b0e-9a1d-0000deadbeef"
+NAME="/dev/sda3" TYPE="part" FSTYPE="crypto_LUKS" UUID="a1b2c3d4-2222-4c1f-8e2a-1111feedface"
+NAME="/dev/sda" TYPE="disk" FSTYPE="" UUID=""

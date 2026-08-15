@@ -1,0 +1,7 @@
+dracut-luks (0.1.0) UNRELEASED; urgency=medium
+
+  * Initial release. GRUB drop-in that derives rd.luks.* at update-grub
+    time, dracut drop-ins for the crypt modules and FIDO2/TPM2 token
+    plugins, and the dracut-luks-setup helper.
+
+ -- Joshua Miller <freshroot@lamille.net>  Fri, 15 Aug 2026 00:00:00 +0000

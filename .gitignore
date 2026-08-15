@@ -1,0 +1,12 @@
+# Debian build artifacts
+*.deb
+*.buildinfo
+*.changes
+*.tar.*
+debian/.debhelper/
+debian/dracut-luks/
+debian/files
+debian/debhelper-build-stamp
+debian/*.substvars
+debian/*.log
+target/

@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dracut-luks]
+  pull_request:
+
+jobs:
+  lint-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: sudo apt-get install -y shellcheck
+
+      - name: Shellcheck
+        run: make lint
+
+      - name: Discovery and GRUB drop-in tests
+        run: make test
+
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: ubuntu:noble
+    env:
+      DEBIAN_FRONTEND: noninteractive
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Install build dependencies
+        run: |
+          set -eux
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates \
+            build-essential \
+            dpkg-dev \
+            debhelper \
+            git
+
+      - uses: actions/checkout@v4
+
+      - name: Build package
+        run: dpkg-buildpackage -us -uc -b
+
+      - name: Verify package contents
+        run: |
+          set -eux
+          dpkg-deb -c ../dracut-luks_*.deb
+          dpkg-deb -I ../dracut-luks_*.deb
+          # The three /etc files must be conffiles
+          dpkg-deb -I ../dracut-luks_*.deb conffiles | grep -c '^/etc/' | grep -qx 3

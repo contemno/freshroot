@@ -1,0 +1,4 @@
+NAME="/dev/mapper/my--vg-root" TYPE="lvm" FSTYPE="xfs" UUID="1f2e3d4c-7777-4a5b-8c9d-6666c0ffeeaa"
+NAME="/dev/mapper/luks-8b7a" TYPE="crypt" FSTYPE="LVM2_member" UUID="2e3d4c5b-8888-4b6c-9d0e-7777decafbad"
+NAME="/dev/sdb2" TYPE="part" FSTYPE="crypto_LUKS" UUID="3d4c5b6a-9999-4c7d-0e1f-8888feed5eed"
+NAME="/dev/sdb" TYPE="disk" FSTYPE="" UUID=""
