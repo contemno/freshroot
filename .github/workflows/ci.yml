@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [main]
 
+# Least privilege: nothing here needs more than a read-only token.
+permissions:
+  contents: read
 
 jobs:
   lint:

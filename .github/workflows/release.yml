@@ -4,6 +4,10 @@ on:
   push:
     tags: ["v*"]
 
+# Least privilege: read-only by default; only the release job elevates to
+# contents: write for publishing the GitHub release.
+permissions:
+  contents: read
 
 jobs:
   lint:
