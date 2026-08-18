@@ -1,0 +1,77 @@
+name: Security
+
+# Scheduled security scanning, separate from Dependabot: Dependabot only
+# proposes an update when a NEW upstream release exists. It says nothing about
+# leaked secrets or code-level findings in what is already committed. This
+# workflow covers that gap with three scans:
+#   * gitleaks — secret scanning across the full git history
+#   * CodeQL   — SAST over the GitHub Actions workflows (CodeQL has no shell
+#                support, so the workflows are the only analyzable content;
+#                the shell scripts are covered by shellcheck in CI)
+#   * Trivy    — filesystem vulnerability/misconfiguration scan, uploaded as
+#                SARIF to the Security tab
+#
+# There is no ecosystem advisory scan (cargo audit / pip-audit / npm audit
+# equivalent): the deb's dependencies come from debian/control and are
+# resolved by apt at build time — there is no committed lockfile to audit.
+#
+# Intentionally NOT a required check: advisory-DB churn shouldn't block an
+# unrelated PR. A finding turns the job red for visibility (and, for
+# Trivy/CodeQL, shows up in the Security tab) without wedging merges.
+on:
+  schedule:
+    - cron: '0 6 * * 1'  # weekly, Monday 06:00 UTC
+  pull_request:
+    # Only the paths that change what the scans cover: the workflows
+    # themselves and the package's build/runtime dependency declarations.
+    paths:
+      - '.github/workflows/**'
+      - 'debian/control'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          fetch-depth: 0  # gitleaks needs history, not just the working tree
+
+      - uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7  # v2.3.9
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  codeql:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write  # required to upload SARIF to the Security tab
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+
+      - uses: github/codeql-action/init@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd  # v4.37.7
+        with:
+          languages: actions
+          queries: security-and-quality
+      - uses: github/codeql-action/analyze@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd  # v4.37.7
+
+  trivy-fs:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+
+      - uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
+        with:
+          scan-type: fs
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH
+      - uses: github/codeql-action/upload-sarif@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd  # v4.37.7, same pin as codeql job
+        with:
+          sarif_file: trivy-results.sarif

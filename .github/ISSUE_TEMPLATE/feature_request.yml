@@ -1,0 +1,60 @@
+name: ✨ Feature request
+description: Suggest a new capability or improvement
+labels: ["enhancement", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the idea! Check the roadmap/milestones first in case it's
+        already planned.
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Pre-flight
+      options:
+        - label: I searched existing issues and this isn't already proposed
+          required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / motivation
+      description: What are you trying to do, and what's getting in the way today?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What should it do? Sketch the UX or workflow if you can.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Existing workarounds, or other approaches you weighed.
+
+  # Surface the project's core guarantees at the moment work is proposed.
+  # These mirror the sync points documented in CLAUDE.md.
+  - type: checkboxes
+    id: invariants
+    attributes:
+      label: Project invariants
+      description: Does this proposal respect the guarantees this project must not break?
+      options:
+        - label: >-
+            This preserves the every-boot-starts-from-a-read-only-snapshot
+            guarantee (runtime changes discarded, persistent state only on
+            dedicated subvolumes), or I've noted how it affects it.
+        - label: >-
+            If this touches the persistent subvolume set, all four sync points
+            in installer/freshroot-setup move together (Phase 2 create,
+            Phase 3 migrate, Phase 4 fstab, Phase 7 cleanup whitelist).
+        - label: >-
+            If this touches a lineage/snapshot helper, every copy moves
+            together (freshroot-update, freshroot-build, freshroot-install,
+            and the guarded copy in 06_freshroot).
