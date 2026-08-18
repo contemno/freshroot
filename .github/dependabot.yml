@@ -1,0 +1,21 @@
+version: 2
+updates:
+  # GitHub Actions: pinned to commit SHAs in workflow files. Dependabot rewrites
+  # the SHA and updates the trailing version comment in lockstep.
+  #
+  # No target-branch: freshroot uses a single main branch, so update PRs open
+  # against the default branch. No other package ecosystem applies — the deb's
+  # build dependencies come from debian/control and are resolved by apt at
+  # build time; there is no committed lockfile for Dependabot to manage.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]   # one grouped PR, not one per action
+    # Let a freshly published (possibly compromised) action release age before
+    # Dependabot proposes adopting it. This only delays routine version bumps —
+    # Dependabot security-advisory PRs bypass cooldown automatically.
+    cooldown:
+      default-days: 14
