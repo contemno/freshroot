@@ -112,7 +112,7 @@ ROOTFS_SUBVOL="${ROOTFS_SUBVOL:-@rootfs}"
 
 # ── Globals ──────────────────────────────────────────────────────────
 TOPLEVEL="/run/freshroot-install/btrfs-toplevel"
-TS="$(date +%Y%m%dT%H%M%S)"
+TS="$(date -u +%Y%m%dT%H%M%S)"
 # Shared with freshroot-update/-build so the pipelines are mutually exclusive
 # (all manipulate @staging, the top-level mount and update-grub).
 LOCKFILE="/run/freshroot-update.lock"
@@ -122,8 +122,8 @@ BOOT_ARCHIVE="${BOOT_PARTITION:-/boot}/freshroot"
 
 # ── Helpers ──────────────────────────────────────────────────────────
 die()  { echo "FATAL: $*" | tee -a "$LOG_FILE" >&2; exit 1; }
-info() { echo "[$(date +%H:%M:%S)] $*" | tee -a "$LOG_FILE"; }
-warn() { echo "[$(date +%H:%M:%S)] WARNING: $*" | tee -a "$LOG_FILE" >&2; }
+info() { echo "[$(date -u +%H:%M:%S)] $*" | tee -a "$LOG_FILE"; }
+warn() { echo "[$(date -u +%H:%M:%S)] WARNING: $*" | tee -a "$LOG_FILE" >&2; }
 
 # Bind / unbind the shared /boot (+EFI) partitions into a subvolume tree so
 # kernel installs inside the container land on the real boot partition.
@@ -786,7 +786,7 @@ clear_stale_staging() {
 COMMITTED_NAME=""
 commit_staging_as() {
     local lineage="$1" new_ts
-    new_ts="$(date +%Y%m%dT%H%M%S)"
+    new_ts="$(date -u +%Y%m%dT%H%M%S)"
     COMMITTED_NAME="root.${lineage}.${new_ts}"
     info "creating new read-only snapshot: ${SNAP_PATH}/${COMMITTED_NAME}"
     btrfs subvolume snapshot -r "$STAGING_PATH" "${SNAP_PATH}/${COMMITTED_NAME}" \

@@ -1,0 +1,51 @@
+name: 📋 Task / roadmap item
+description: An engineering task, refactor, spike, or roadmap item (usually maintainer-filed)
+labels: ["task"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For planned work — a refactor, infrastructure, a research spike, or a
+        roadmap item. Link it to a milestone so the plan stays in sync.
+        (User-facing bugs or feature ideas → the Bug or Feature forms.)
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What needs doing, and why now?
+    validations:
+      required: true
+
+  - type: input
+    id: roadmap
+    attributes:
+      label: Milestone / roadmap link
+      description: The milestone this belongs to.
+
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope / approach
+      description: Sketch the steps or the shape of the change. Note anything out of scope.
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: How do we know it's done? Include the docs that must move.
+      placeholder: |
+        - [ ] ...
+        - [ ] CLAUDE.md / README updated or N/A
+        - [ ] make lint && make build pass
+
+  - type: checkboxes
+    id: contract
+    attributes:
+      label: On-disk / cross-file contract impact
+      options:
+        - label: >-
+            This may change on-disk state shared across tools (subvolume set,
+            snapshot naming, conffile keys, /boot/freshroot) — every reader
+            and writer of that state must move together, and new conf keys
+            need pre-source defaults for existing installs.
