@@ -72,9 +72,9 @@ Runs manually or every 4 hours via the systemd timer:
    - `@apt-cache` onto `/var/cache/apt` so downloaded `.deb` files persist across runs.
    - The btrfs top-level (subvolid=5) at `/run/freshroot-toplevel` so `install.sh` can manage top-level subvolumes (`btrfs subvolume create /run/freshroot-toplevel/@whatever`). This exposes all subvolumes rw to the container — only list trusted entries in `REPOS`.
    - Any host paths listed in `BIND_MOUNTS` (for local dev or shipping secrets).
-4. Before apt runs, scan all existing snapshots for in-use kernel versions and `apt-mark hold` them so `autoremove` can't delete kernels older snapshots depend on.
+4. Before apt runs, re-link any kernels the source snapshot needs back into the flat `/boot` names from its `/boot/freshroot/<snapshot>/` archive, and release kernel holds left by the retired hold-based protection scheme. `autoremove` may delete flat kernel names freely — every snapshot's archive keeps hardlinks to its own kernel pair, so no other snapshot can be stranded.
 5. Inside the container: `apt full-upgrade`, cloud-init provisioning (`cloud-init init --local`, `init`, `modules --mode={config,final}`), then clone and run `./install.sh` from each repo listed in `REPOS`. Entries using the `local://<path>` scheme skip the clone and run `install.sh` directly (pair with `BIND_MOUNTS` to test uncommitted code).
-6. **On success:** snapshot `@staging` as a new read-only snapshot in the same lineage, delete `@staging`, prune each lineage past its quota, and `update-grub`.
+6. **On success:** snapshot `@staging` as a new read-only snapshot in the same lineage, freeze its kernel pair(s) as hardlinks under `/boot/freshroot/<snapshot>/` (GRUB entries point there; `/boot` is ext4, so identical content costs nothing), delete `@staging`, prune each lineage past its quota (removing pruned snapshots' archives with them), and `update-grub`.
 7. **On failure:** retain `@staging` for investigation, log the error.
 8. The user reboots at their convenience to activate the new snapshot.
 
@@ -89,8 +89,8 @@ sudo freshroot-install --release 26.04     # or: --release resolute
 # Try it from the GRUB menu; when happy, make it the default boot lineage
 sudo freshroot-install --switch ubuntu-26.04
 
-# Didn't like it? Remove the whole lineage (its kernels are released on the
-# next update run: stale holds are dropped, then apt autoremove collects them)
+# Didn't like it? Remove the whole lineage (its /boot kernel archives go
+# with it; unreferenced flat kernels are autoremoved on the next update run)
 sudo freshroot-install --remove ubuntu-26.04
 ```
 
@@ -252,8 +252,10 @@ What the GRUB hook expects from a foreign lineage:
   90freshroot dracut module are recognized without the marker.
 - **Kernels**: `/boot/vmlinuz-<kver>` plus `/boot/initrd.img-<kver>` *or*
   `/boot/initramfs-<kver>.img`, with matching `/usr/lib/modules/<kver>` in
-  the tree. Unversioned kernel names (Arch's `vmlinuz-linux`) are not
-  matched.
+  the tree. `--import` also accepts the pair inside the imported tree's own
+  `/boot` and copies it into the snapshot's `/boot/freshroot/<name>/`
+  archive at commit. Unversioned kernel names (Arch's `vmlinuz-linux`) are
+  not matched.
 - **Unlock parameters**: entries get the host's dracut-style
   `rd.luks.uuid=<uuid> rd.luks.name=<uuid>=<name>` appended. If the
   distro's initramfs unlocks differently, ship a single-line
@@ -283,5 +285,5 @@ See [migrate.sh](migrate.sh) for the full upgrade path. In short: disable the ol
 - **Dracut replaces initramfs-tools.** The package declares `Conflicts: initramfs-tools` so dpkg handles the swap.
 - **Migration window:** after the new freshroot lands in a snapshot but before you reboot into it, the *running* (old) tools keep committing legacy-named snapshots — harmless, they resolve into the right lineage by os-release. The `@` subvolume keeps the install-time tooling forever, so tainted-boot updates run pre-lineage code; refresh `@` (tainted boot + `apt install ./freshroot_*.deb`) before relying on updates from a tainted boot.
 - **`@base` and release switches:** `freshroot-build`'s pinned `@base` stays on its original release. After switching lineages, reseed it (`btrfs subvolume delete <toplevel>/@base`, then `freshroot-build --init-base --from @snapshots/<new-lineage snapshot>`); the build tool warns when `@base`'s lineage differs from the booted one.
-- **Shared /boot, shared initrds:** Ubuntu HWE kernels can reuse the same `<kver>` across releases; in that case two lineages share one `/boot/initrd.img-<kver>`, owned by whichever lineage's update ran last. Distinct-release lineages normally have distinct kernel ABIs, so this is rare — but it is a known limitation. Relatedly, the GRUB hook's ceremony gating probes the snapshot *tree* (marker file / dracut module), while the ceremony actually runs from the initrd in `/boot` — for a shared-`<kver>` initrd built by a non-freshroot lineage the gate can be wrong. Keep foreign lineages on their own kernel versions.
-- **Removing a lineage** (`freshroot-install --remove`) leaves two things to clean up: its `LINEAGE_QUOTAS` entry in the conffile (printed as a reminder), and its kernels in `/boot`, which are released automatically on the next update run (stale holds dropped, then `apt autoremove` collects them).
+- **Per-snapshot kernel archives:** each committed snapshot's `vmlinuz`/`initrd` pair is frozen as hardlinks under `/boot/freshroot/<snapshot>/`, and its GRUB entries boot from there — so `apt autoremove` (or anything else) unlinking the flat `/boot` names cannot strand another snapshot, and each snapshot keeps the exact initrd bytes it was committed with even when two lineages reuse one `<kver>` (Ubuntu HWE). Snapshots that predate the archive are backfilled on the next update/build run and boot from the flat names until then. The archives are managed by the tools; don't edit them by hand.
+- **Removing a lineage** (`freshroot-install --remove`) deletes its snapshots and their kernel archives; the one leftover to clean up is its `LINEAGE_QUOTAS` entry in the conffile (printed as a reminder). Flat `/boot` kernels no remaining tree references are collected by `apt autoremove` on the next update run.
