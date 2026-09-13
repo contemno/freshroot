@@ -17,11 +17,12 @@
 # Boot selection is unchanged: 06_freshroot boots each lineage's newest
 # snapshot, so the snapshot produced here boots with no GRUB/initramfs change.
 #
-# NOTE: the helpers resolve_btrfs_device, protect_snapshot_kernels, the bind
-# arrays, the lineage/prune helpers and die/info/warn are intentionally COPIED
-# from /usr/sbin/freshroot-update (the tools must not share a library per the
-# "edit minimum / new utility alongside" design). If you fix a bug in one, fix
-# it in freshroot-update, freshroot-install and (partial copy) 06_freshroot too.
+# NOTE: the helpers resolve_btrfs_device, protect_snapshot_kernels,
+# staged_tree_bootable, the bind arrays, the lineage/prune helpers and
+# die/info/warn are intentionally COPIED from /usr/sbin/freshroot-update (the
+# tools must not share a library per the "edit minimum / new utility
+# alongside" design). If you fix a bug in one, fix it in freshroot-update,
+# freshroot-install and (partial copy) 06_freshroot too.
 # See the Sync-Point Checklist in the project plan.
 set -euo pipefail
 
@@ -542,6 +543,34 @@ protect_snapshot_kernels() {
     fi
 }
 
+# ── Verify the staged tree has a bootable kernel pair in /boot ───────
+# GRUB (06_freshroot) pairs a snapshot only with kernels whose modules are
+# in the tree AND whose vmlinuz + initrd exist in /boot. A tree that fails
+# this would be committed but never booted — the clean entry silently falls
+# back to an older snapshot, and every later run clones the broken tree.
+# Returns 1 (after logging each kernel's state) when nothing is bootable.
+# SYNC: copied in freshroot-update, freshroot-build and freshroot-install.
+staged_tree_bootable() {
+    local tree="$1" mod_dir kver ok=0 states=() s
+    for mod_dir in "${tree}/usr/lib/modules"/*/; do
+        [[ -d "$mod_dir" ]] || continue
+        kver=$(basename "$mod_dir")
+        if [[ ! -e "${BOOT_PARTITION}/vmlinuz-${kver}" ]]; then
+            states+=("${kver}: no ${BOOT_PARTITION}/vmlinuz-${kver}")
+        elif [[ ! -e "${BOOT_PARTITION}/initrd.img-${kver}" && \
+                ! -e "${BOOT_PARTITION}/initramfs-${kver}.img" ]]; then
+            states+=("${kver}: no initrd in ${BOOT_PARTITION}")
+        else
+            ok=1
+        fi
+    done
+    [[ $ok -eq 1 ]] && return 0
+    warn "staged tree has no kernel with a vmlinuz + initrd pair in ${BOOT_PARTITION}"
+    for s in "${states[@]}"; do warn "  ${s}"; done
+    [[ ${#states[@]} -gt 0 ]] || warn "  (no kernel modules in the tree at all)"
+    return 1
+}
+
 # Disable nspawn's default seccomp filter (trusted code; apt/git are
 # syscall-heavy and the filter adds measurable overhead).
 export SYSTEMD_SECCOMP=0
@@ -578,6 +607,34 @@ if [[ $INTERACTIVE -eq 0 ]]; then
 apt-get update
 apt-get full-upgrade -y
 apt-get autoremove -y
+
+# ── Repair missing kernel files in /boot ─────────────────────────────
+# GRUB pairs a snapshot only with kernels whose vmlinuz AND initrd exist in
+# the shared /boot. A kernel whose files went missing there (a failed initrd
+# build, manual cleanup, a foreign tool's autoremove) is still "installed"
+# as far as apt is concerned, so nothing would ever put them back — and
+# every later clone of this tree would inherit the gap.
+for mod_dir in /usr/lib/modules/*/; do
+    kver="${mod_dir%/}"; kver="${kver##*/}"
+    # Only kernels a package still owns; leftover module dirs are skipped.
+    pkg=$(dpkg -S "/boot/vmlinuz-${kver}" 2>/dev/null | head -1 | cut -d: -f1) || pkg=""
+    [ -n "$pkg" ] || continue
+    if [ ! -e "/boot/vmlinuz-${kver}" ]; then
+        echo "==> /boot/vmlinuz-${kver} missing — reinstalling ${pkg}"
+        apt-get install -y --reinstall "$pkg" \
+            || echo "WARNING: reinstall of ${pkg} failed" >&2
+    fi
+    if [ ! -e "/boot/initrd.img-${kver}" ] && [ ! -e "/boot/initramfs-${kver}.img" ]; then
+        echo "==> no initrd for ${kver} in /boot — regenerating"
+        if command -v dracut >/dev/null 2>&1; then
+            dracut -f "/boot/initrd.img-${kver}" "${kver}" \
+                || echo "WARNING: dracut failed for ${kver}" >&2
+        elif command -v update-initramfs >/dev/null 2>&1; then
+            update-initramfs -c -k "${kver}" \
+                || echo "WARNING: update-initramfs failed for ${kver}" >&2
+        fi
+    fi
+done
 
 INNER
 
@@ -707,6 +764,9 @@ umount_boot_binds "$STAGING_PATH"
 if [[ $NSPAWN_RC -ne 0 ]]; then
     die "component build failed (exit $NSPAWN_RC) — staging retained at ${STAGING_SUBVOL}"
 fi
+
+staged_tree_bootable "$STAGING_PATH" \
+    || die "refusing to commit a tree GRUB could not boot — staging retained at ${STAGING_SUBVOL}; check free space in ${BOOT_PARTITION} and the kernel/dracut output above"
 
 # ── Create new read-only snapshot from the component layer ───────────
 # The lineage label is derived from the staged tree's os-release (@base has
