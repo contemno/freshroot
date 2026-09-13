@@ -224,6 +224,29 @@ best_kernel_for() {
     return 0
 }
 
+# --- Describe every kernel in a tree (diagnostics for the warnings) ---
+# "<kver> (bootable)", "<kver> (no /boot/vmlinuz-<kver>)" or
+# "<kver> (no initrd in /boot)", comma-separated.
+kernel_state_for() {
+    _root="$1"; _out=""
+    for _m in "${_root}"/usr/lib/modules/*/; do
+        [ -d "$_m" ] || continue
+        _k="${_m%/}"; _k="${_k##*/}"
+        if [ ! -e "/boot/vmlinuz-${_k}" ]; then
+            _out="${_out}${_k} (no /boot/vmlinuz-${_k}), "
+        elif [ -z "${INITRD_PATH[$_k]-}" ]; then
+            _out="${_out}${_k} (no initrd in /boot), "
+        else
+            _out="${_out}${_k} (bootable), "
+        fi
+    done
+    if [ -n "$_out" ]; then
+        printf '%s\n' "${_out%, }"
+    else
+        printf '%s\n' "no kernel modules in the tree"
+    fi
+}
+
 # --- Emit a single GRUB menu entry ---
 # Reads kernel info from BK_REL, BK_VMLINUZ, BK_INITRD.
 emit_entry() {
@@ -359,6 +382,7 @@ emit_clean_for_lineage() {
         if best_kernel_for "${SNAPSHOT_DIR}/${_snap}"; then
             if [ "$_snap" != "$_newest" ]; then
                 echo "Warning: lineage ${_lin}: newest snapshot ${_newest} has no bootable kernel pair — clean entry uses ${_snap}" >&2
+                echo "Warning:   kernels in ${_newest}: $(kernel_state_for "${SNAPSHOT_DIR}/${_newest}")" >&2
             fi
             _ts_disp=$(display_ts "$_snap")
             _cap="yes"
@@ -453,13 +477,16 @@ elif emit_clean_for_lineage "$FIRST_LINEAGE"; then
     :
 else
     echo "Warning: default lineage ${FIRST_LINEAGE} has no bootable snapshot — tainted entry promoted" >&2
+    [ -n "$_newest" ] && echo "Warning:   kernels in ${_newest}: $(kernel_state_for "${SNAPSHOT_DIR}/${_newest}")" >&2
     emit_tainted
     TAINTED_DONE=1
 fi
 
 for _lin in $REMAINING_LINEAGES; do
-    emit_clean_for_lineage "$_lin" || \
+    if ! emit_clean_for_lineage "$_lin"; then
         echo "Warning: lineage ${_lin} has no bootable snapshot in /boot" >&2
+        [ -n "$_newest" ] && echo "Warning:   kernels in ${_newest}: $(kernel_state_for "${SNAPSHOT_DIR}/${_newest}")" >&2
+    fi
 done
 
 if [ "$TAINTED_DONE" = "0" ]; then
