@@ -17,7 +17,7 @@
 #   --remove   Delete all snapshots of a lineage.
 #
 # NOTE: the helpers resolve_btrfs_device, protect_snapshot_kernels,
-# staged_tree_bootable, the boot-bind helpers, the lineage/prune helpers
+# bootable_kernel_present, the boot-bind helpers, the lineage/prune helpers
 # and die/info/warn are intentionally COPIED from /usr/sbin/freshroot-update
 # (the tools must not share a library per the "edit minimum / new utility
 # alongside" design). If you fix a bug in one, fix it in freshroot-update,
@@ -455,16 +455,17 @@ resolve_from_ref() {
     latest_in_lineage "$ref"
 }
 
-# ── Verify the staged tree has a bootable kernel pair in /boot ───────
-# GRUB (06_freshroot) pairs a snapshot only with kernels whose modules are
-# in the tree AND whose vmlinuz + initrd exist in /boot. A tree that fails
-# this would be committed but never booted — the clean entry silently falls
-# back to an older snapshot, and every later run clones the broken tree.
+# ── Verify a bootable kernel pair exists for the shared modules ──────
+# Kernel modules live on a dedicated persistent subvolume mounted at
+# /usr/lib/modules and shared by every snapshot; GRUB (06_freshroot) pairs
+# snapshots with the kernels found there whose vmlinuz + initrd exist in
+# /boot. Committing while no such pair exists would produce a snapshot GRUB
+# never offers — the clean entry silently falls back to an older one.
 # Returns 1 (after logging each kernel's state) when nothing is bootable.
 # SYNC: copied in freshroot-update, freshroot-build and freshroot-install.
-staged_tree_bootable() {
-    local tree="$1" mod_dir kver ok=0 states=() s
-    for mod_dir in "${tree}/usr/lib/modules"/*/; do
+bootable_kernel_present() {
+    local mod_dir kver ok=0 states=() s
+    for mod_dir in /usr/lib/modules/*/; do
         [[ -d "$mod_dir" ]] || continue
         kver=$(basename "$mod_dir")
         if [[ ! -e "${BOOT_PARTITION}/vmlinuz-${kver}" ]]; then
@@ -477,9 +478,9 @@ staged_tree_bootable() {
         fi
     done
     [[ $ok -eq 1 ]] && return 0
-    warn "staged tree has no kernel with a vmlinuz + initrd pair in ${BOOT_PARTITION}"
+    warn "no kernel in /usr/lib/modules has a vmlinuz + initrd pair in ${BOOT_PARTITION}"
     for s in "${states[@]}"; do warn "  ${s}"; done
-    [[ ${#states[@]} -gt 0 ]] || warn "  (no kernel modules in the tree at all)"
+    [[ ${#states[@]} -gt 0 ]] || warn "  (no kernel modules in /usr/lib/modules at all)"
     return 1
 }
 
@@ -984,7 +985,7 @@ INNER
     new_lineage="${LINEAGE_FLAG:-$new_derived}"
     require_lineage_empty "$new_lineage"
 
-    staged_tree_bootable "$STAGING_PATH" \
+    bootable_kernel_present \
         || die "refusing to commit a tree GRUB could not boot — staging retained at ${STAGING_SUBVOL}; check free space in ${BOOT_PARTITION} and the kernel/dracut output above"
 
     commit_staging_as "$new_lineage"

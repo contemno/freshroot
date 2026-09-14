@@ -251,9 +251,10 @@ What the GRUB hook expects from a foreign lineage:
   (content: the ceremony version, currently `1`). Trees containing the
   90freshroot dracut module are recognized without the marker.
 - **Kernels**: `/boot/vmlinuz-<kver>` plus `/boot/initrd.img-<kver>` *or*
-  `/boot/initramfs-<kver>.img`, with matching `/usr/lib/modules/<kver>` in
-  the tree. Unversioned kernel names (Arch's `vmlinuz-linux`) are not
-  matched.
+  `/boot/initramfs-<kver>.img`, with matching `/usr/lib/modules/<kver>` on
+  the running system's shared modules subvolume (snapshot trees are not
+  inspected for modules). Unversioned kernel names (Arch's `vmlinuz-linux`)
+  are not matched.
 - **Unlock parameters**: entries get the host's dracut-style
   `rd.luks.uuid=<uuid> rd.luks.name=<uuid>=<name>` appended. If the
   distro's initramfs unlocks differently, ship a single-line
@@ -284,5 +285,5 @@ See [migrate.sh](migrate.sh) for the full upgrade path. In short: disable the ol
 - **Migration window:** after the new freshroot lands in a snapshot but before you reboot into it, the *running* (old) tools keep committing legacy-named snapshots — harmless, they resolve into the right lineage by os-release. The `@` subvolume keeps the install-time tooling forever, so tainted-boot updates run pre-lineage code; refresh `@` (tainted boot + `apt install ./freshroot_*.deb`) before relying on updates from a tainted boot.
 - **`@base` and release switches:** `freshroot-build`'s pinned `@base` stays on its original release. After switching lineages, reseed it (`btrfs subvolume delete <toplevel>/@base`, then `freshroot-build --init-base --from @snapshots/<new-lineage snapshot>`); the build tool warns when `@base`'s lineage differs from the booted one.
 - **Shared /boot, shared initrds:** Ubuntu HWE kernels can reuse the same `<kver>` across releases; in that case two lineages share one `/boot/initrd.img-<kver>`, owned by whichever lineage's update ran last. Distinct-release lineages normally have distinct kernel ABIs, so this is rare — but it is a known limitation. Relatedly, the GRUB hook's ceremony gating probes the snapshot *tree* (marker file / dracut module), while the ceremony actually runs from the initrd in `/boot` — for a shared-`<kver>` initrd built by a non-freshroot lineage the gate can be wrong. Keep foreign lineages on their own kernel versions.
-- **`Warning: ... newest snapshot ... has no bootable kernel pair`** from `update-grub` means none of that snapshot's kernels (its `/usr/lib/modules/<kver>` directories) has both `/boot/vmlinuz-<kver>` and an initrd in the shared `/boot`; the warning's second line names the missing file per kernel. Typical causes are a failed initrd build (a full `/boot`) or a kernel file deleted from `/boot` outside freshroot. The next `freshroot-update` run reinstalls a missing kernel image and regenerates a missing initrd inside the staging container, and refuses to commit a tree that is still unbootable (staging is retained). Free space in `/boot` first if it is full.
+- **`Warning: ... newest snapshot ... has no bootable kernel pair`** from `update-grub` means no kernel on the shared modules subvolume (`/usr/lib/modules/<kver>` on the running system; snapshot trees are not inspected) has both `/boot/vmlinuz-<kver>` and an initrd in the shared `/boot`; the warning's second line names the missing file per kernel. Typical causes are a failed initrd build (a full `/boot`) or a kernel file deleted from `/boot` outside freshroot. The next `freshroot-update` run reinstalls a missing kernel image and regenerates a missing initrd inside the staging container, and refuses to commit a tree that is still unbootable (staging is retained). Free space in `/boot` first if it is full.
 - **Removing a lineage** (`freshroot-install --remove`) leaves two things to clean up: its `LINEAGE_QUOTAS` entry in the conffile (printed as a reminder), and its kernels in `/boot`, which are released automatically on the next update run (stale holds dropped, then `apt autoremove` collects them).
