@@ -30,9 +30,12 @@
 # read-only snapshot directly. A snapshot may ship /etc/freshroot/cmdline
 # (single line) to replace the auto-generated rd.luks.* parameters.
 #
-# Each entry is paired only with kernels whose modules exist inside the
-# target root, preventing kernel panics from missing modules. Initrds are
-# looked up as /boot/initrd.img-<kver> or /boot/initramfs-<kver>.img.
+# Kernel modules live on a dedicated persistent subvolume mounted at
+# /usr/lib/modules and shared by every snapshot, so any kernel boots any
+# snapshot. Entries are paired with the kernels whose modules exist there
+# on the running system; snapshot trees are never inspected for modules.
+# Initrds are looked up as /boot/initrd.img-<kver> or
+# /boot/initramfs-<kver>.img.
 #
 # This script runs under plain `set -e` (no -u/pipefail) inside
 # grub-mkconfig and kernel postinsts — keep per-snapshot lookups ||-guarded.
@@ -197,18 +200,20 @@ for _krel in $ALL_BOOT_KERNELS; do
     fi
 done
 
-# --- Find kernels compatible with a given root path ---
-# Returns matching kernel versions (newest first) on stdout.
-# A kernel is compatible if its modules dir exists inside the root
-# AND a matching initrd exists in /boot.
+# --- Bootable kernels (newest first) ---
+# A kernel is bootable when its modules exist in the shared /usr/lib/modules
+# AND a matching initrd exists in /boot. Resolved once: the set is the same
+# for every root, so kernels_for ignores the root path it is given.
+BOOTABLE_KERNELS=""
+for _krel in $ALL_BOOT_KERNELS; do
+    if [ -d "/usr/lib/modules/${_krel}" ] && [ -n "${INITRD_PATH[$_krel]-}" ]; then
+        BOOTABLE_KERNELS="${BOOTABLE_KERNELS}${_krel}
+"
+    fi
+done
+
 kernels_for() {
-    _root="$1"
-    for _krel in $ALL_BOOT_KERNELS; do
-        if [ -d "${_root}/usr/lib/modules/${_krel}" ] && \
-           [ -n "${INITRD_PATH[$_krel]-}" ]; then
-            echo "$_krel"
-        fi
-    done
+    printf '%s' "$BOOTABLE_KERNELS"
 }
 
 # --- Find the newest compatible kernel for a root path ---
@@ -224,12 +229,12 @@ best_kernel_for() {
     return 0
 }
 
-# --- Describe every kernel in a tree (diagnostics for the warnings) ---
+# --- Describe every kernel in /usr/lib/modules (diagnostics) ---
 # "<kver> (bootable)", "<kver> (no /boot/vmlinuz-<kver>)" or
 # "<kver> (no initrd in /boot)", comma-separated.
-kernel_state_for() {
-    _root="$1"; _out=""
-    for _m in "${_root}"/usr/lib/modules/*/; do
+kernel_state() {
+    _out=""
+    for _m in /usr/lib/modules/*/; do
         [ -d "$_m" ] || continue
         _k="${_m%/}"; _k="${_k##*/}"
         if [ ! -e "/boot/vmlinuz-${_k}" ]; then
@@ -243,7 +248,7 @@ kernel_state_for() {
     if [ -n "$_out" ]; then
         printf '%s\n' "${_out%, }"
     else
-        printf '%s\n' "no kernel modules in the tree"
+        printf '%s\n' "no kernel modules in /usr/lib/modules"
     fi
 }
 
@@ -382,7 +387,7 @@ emit_clean_for_lineage() {
         if best_kernel_for "${SNAPSHOT_DIR}/${_snap}"; then
             if [ "$_snap" != "$_newest" ]; then
                 echo "Warning: lineage ${_lin}: newest snapshot ${_newest} has no bootable kernel pair — clean entry uses ${_snap}" >&2
-                echo "Warning:   kernels in ${_newest}: $(kernel_state_for "${SNAPSHOT_DIR}/${_newest}")" >&2
+                echo "Warning:   kernels in /usr/lib/modules: $(kernel_state)" >&2
             fi
             _ts_disp=$(display_ts "$_snap")
             _cap="yes"
@@ -477,7 +482,7 @@ elif emit_clean_for_lineage "$FIRST_LINEAGE"; then
     :
 else
     echo "Warning: default lineage ${FIRST_LINEAGE} has no bootable snapshot — tainted entry promoted" >&2
-    [ -n "$_newest" ] && echo "Warning:   kernels in ${_newest}: $(kernel_state_for "${SNAPSHOT_DIR}/${_newest}")" >&2
+    echo "Warning:   kernels in /usr/lib/modules: $(kernel_state)" >&2
     emit_tainted
     TAINTED_DONE=1
 fi
@@ -485,7 +490,7 @@ fi
 for _lin in $REMAINING_LINEAGES; do
     if ! emit_clean_for_lineage "$_lin"; then
         echo "Warning: lineage ${_lin} has no bootable snapshot in /boot" >&2
-        [ -n "$_newest" ] && echo "Warning:   kernels in ${_newest}: $(kernel_state_for "${SNAPSHOT_DIR}/${_newest}")" >&2
+        echo "Warning:   kernels in /usr/lib/modules: $(kernel_state)" >&2
     fi
 done
 
