@@ -72,7 +72,7 @@ Runs manually or every 4 hours via the systemd timer:
    - `@apt-cache` onto `/var/cache/apt` so downloaded `.deb` files persist across runs.
    - The btrfs top-level (subvolid=5) at `/run/freshroot-toplevel` so `install.sh` can manage top-level subvolumes (`btrfs subvolume create /run/freshroot-toplevel/@whatever`). This exposes all subvolumes rw to the container — only list trusted entries in `REPOS`.
    - Any host paths listed in `BIND_MOUNTS` (for local dev or shipping secrets).
-4. Before apt runs, scan all existing snapshots for in-use kernel versions and `apt-mark hold` them so `autoremove` can't delete kernels older snapshots depend on.
+4. Before apt runs, drop any kernel holds left by earlier freshroot versions. Kernel modules live on a shared persistent subvolume mounted at `/usr/lib/modules`, so the newest installed kernel boots every retained snapshot and `autoremove` is free to collect superseded kernels.
 5. Inside the container: `apt full-upgrade`, cloud-init provisioning (`cloud-init init --local`, `init`, `modules --mode={config,final}`), then clone and run `./install.sh` from each repo listed in `REPOS`. Entries using the `local://<path>` scheme skip the clone and run `install.sh` directly (pair with `BIND_MOUNTS` to test uncommitted code).
 6. **On success:** snapshot `@staging` as a new read-only snapshot in the same lineage, delete `@staging`, prune each lineage past its quota, and `update-grub`.
 7. **On failure:** retain `@staging` for investigation, log the error.
@@ -89,8 +89,8 @@ sudo freshroot-install --release 26.04     # or: --release resolute
 # Try it from the GRUB menu; when happy, make it the default boot lineage
 sudo freshroot-install --switch ubuntu-26.04
 
-# Didn't like it? Remove the whole lineage (its kernels are released on the
-# next update run: stale holds are dropped, then apt autoremove collects them)
+# Didn't like it? Remove the whole lineage (apt autoremove collects its
+# kernels on the next update run)
 sudo freshroot-install --remove ubuntu-26.04
 ```
 
@@ -286,4 +286,4 @@ See [migrate.sh](migrate.sh) for the full upgrade path. In short: disable the ol
 - **`@base` and release switches:** `freshroot-build`'s pinned `@base` stays on its original release. After switching lineages, reseed it (`btrfs subvolume delete <toplevel>/@base`, then `freshroot-build --init-base --from @snapshots/<new-lineage snapshot>`); the build tool warns when `@base`'s lineage differs from the booted one.
 - **Shared /boot, shared initrds:** Ubuntu HWE kernels can reuse the same `<kver>` across releases; in that case two lineages share one `/boot/initrd.img-<kver>`, owned by whichever lineage's update ran last. Distinct-release lineages normally have distinct kernel ABIs, so this is rare — but it is a known limitation. Relatedly, the GRUB hook's ceremony gating probes the snapshot *tree* (marker file / dracut module), while the ceremony actually runs from the initrd in `/boot` — for a shared-`<kver>` initrd built by a non-freshroot lineage the gate can be wrong. Keep foreign lineages on their own kernel versions.
 - **`Warning: ... newest snapshot ... has no bootable kernel pair`** from `update-grub` means no kernel on the shared modules subvolume (`/usr/lib/modules/<kver>` on the running system; snapshot trees are not inspected) has both `/boot/vmlinuz-<kver>` and an initrd in the shared `/boot`; the warning's second line names the missing file per kernel. Typical causes are a failed initrd build (a full `/boot`) or a kernel file deleted from `/boot` outside freshroot. The next `freshroot-update` run reinstalls a missing kernel image and regenerates a missing initrd inside the staging container, and refuses to commit a tree that is still unbootable (staging is retained). Free space in `/boot` first if it is full.
-- **Removing a lineage** (`freshroot-install --remove`) leaves two things to clean up: its `LINEAGE_QUOTAS` entry in the conffile (printed as a reminder), and its kernels in `/boot`, which are released automatically on the next update run (stale holds dropped, then `apt autoremove` collects them).
+- **Removing a lineage** (`freshroot-install --remove`) leaves two things to clean up: its `LINEAGE_QUOTAS` entry in the conffile (printed as a reminder), and its kernels in `/boot`, which `apt autoremove` collects on the next update run.

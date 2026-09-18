@@ -93,7 +93,7 @@ This is **not** a general-purpose tool. It targets a specific architecture: LUKS
 ### Making the change
 
 4. **Edit the minimum necessary.** Do not refactor surrounding code, add comments to unchanged lines, or "improve" things that weren't asked for.
-5. **Maintain sync points.** If you add a persistent subvolume, update: Phase 2 (create), Phase 3 (migrate_sv call), Phase 4 (fstab line), Phase 7 (whitelist case). If you touch a lineage helper or `protect_snapshot_kernels`, fix all copies: `freshroot-update`, `freshroot-build`, `freshroot-install`, and the sh-dialect copy in `06_freshroot`. If you rename a file, grep the entire project.
+5. **Maintain sync points.** If you add a persistent subvolume, update: Phase 2 (create), Phase 3 (migrate_sv call), Phase 4 (fstab line), Phase 7 (whitelist case). If you touch a lineage helper or `release_kernel_holds`, fix all copies: `freshroot-update`, `freshroot-build`, `freshroot-install`, and the sh-dialect copy in `06_freshroot`. If you rename a file, grep the entire project.
 6. **Respect permissions.** Config files under `data/etc/` must be 644. Executable scripts must be 755. Set permissions on the source files in `data/`, not in `debian/rules`.
 7. **No `debian/conffiles` needed.** debhelper auto-detects files under `/etc/` as conffiles.
 8. **`debian/rules` overrides `dh_auto_build` and `dh_auto_clean` as no-ops** to prevent debhelper from recursively invoking the project Makefile.
