@@ -1,0 +1,4 @@
+disk.img
+freshroot-menu.efi
+serial-*.log
+__pycache__/
