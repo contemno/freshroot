@@ -28,8 +28,8 @@ Usage: freshroot-update [--shell|--gui|--provision] [--lineage NAME] [--from REF
   (no args)        Stage apt updates + REPOS scripts on the current lineage's
                    latest snapshot, commit as a new read-only snapshot.
   --shell, -i      Interactive shell in staging (exit 0 to snapshot, non-zero
-                   to abort). update-grub is disabled inside staging; the host
-                   runs it after commit.
+                   to abort). Kernels are not managed here — see
+                   freshroot-kernel.
   --gui            Like --shell with display/GPU/audio passthrough.
   --provision      First-boot cloud-init provisioning only.
   --lineage NAME   Operate on lineage NAME instead of the booted lineage; the
@@ -59,6 +59,7 @@ if [[ ! -f "$CONF" ]]; then
 fi
 # Defaults for keys the (conffile-preserved) config may predate
 LINEAGE_QUOTAS=()
+MODULES_SUBVOL="@modules"
 # shellcheck source=/dev/null
 source "$CONF"
 BASE_SUBVOL="${BASE_SUBVOL:-@base}"
@@ -77,9 +78,6 @@ warn() { echo "[$(date -u +%H:%M:%S)] WARNING: $*" | tee -a "$LOG_FILE" >&2; }
 
 cleanup() {
     local rc=$?
-    # Unmount staging bind mounts if still up
-    mountpoint -q "${TOPLEVEL}/${STAGING_SUBVOL}${BOOT_PARTITION}" 2>/dev/null && \
-        umount -R "${TOPLEVEL}/${STAGING_SUBVOL}${BOOT_PARTITION}"
     # Check (before unmounting the top-level) whether staging was left behind
     local staging_left=0
     if [[ $rc -ne 0 ]] && btrfs subvolume show "${TOPLEVEL}/${STAGING_SUBVOL}" &>/dev/null; then
@@ -284,10 +282,10 @@ prune_snapshots() {
 }
 
 # ── Suppress update-grub inside the staging tree ─────────────────────
-# Kernel postinsts inside the container would otherwise write the host's
-# grub.cfg (via the bind-mounted /boot) generated without access to
-# @snapshots. Divert it to /bin/true for the container run; the host runs
-# the authoritative update-grub after commit.
+# Trees migrated from the GRUB era still carry grub2-common, whose
+# package hooks call update-grub against the tree's empty /boot. Divert it
+# to /bin/true for the container run; freshroot no longer runs
+# update-grub anywhere (stage 1 reads the snapshot catalog live).
 suppress_staging_update_grub() {
     local root="$1"
     # dpkg-divert (not a plain overwrite) so an apt upgrade of grub2-common
@@ -425,17 +423,6 @@ fi
 info "creating staging subvolume from snapshot"
 btrfs subvolume snapshot "$LATEST" "$STAGING_PATH" || die "failed to create staging snapshot"
 
-# ── Prepare bind mounts for boot/EFI inside staging ─────────────────
-mkdir -p "${STAGING_PATH}${BOOT_PARTITION}"
-mount --bind "$BOOT_PARTITION" "${STAGING_PATH}${BOOT_PARTITION}" \
-    || die "failed to bind-mount $BOOT_PARTITION"
-
-if [[ -n "$EFI_PARTITION" && "$EFI_PARTITION" != "$BOOT_PARTITION" ]]; then
-    mkdir -p "${STAGING_PATH}${EFI_PARTITION}"
-    mount --bind "$EFI_PARTITION" "${STAGING_PATH}${EFI_PARTITION}" \
-        || die "failed to bind-mount $EFI_PARTITION"
-fi
-
 # ── Persist the apt cache across updates ─────────────────────────────
 # Bind the @apt-cache subvolume into the container so downloaded .debs
 # aren't discarded when @staging is deleted.
@@ -507,33 +494,38 @@ release_kernel_holds() {
 
 release_kernel_holds "$STAGING_PATH"
 
-# ── Verify a bootable kernel pair exists for the shared modules ──────
-# Kernel modules live on a dedicated persistent subvolume mounted at
-# /usr/lib/modules and shared by every snapshot; GRUB (06_freshroot) pairs
-# snapshots with the kernels found there whose vmlinuz + initrd exist in
-# /boot. Committing while no such pair exists would produce a snapshot GRUB
-# never offers — the clean entry silently falls back to an older one.
-# Returns 1 (after logging each kernel's state) when nothing is bootable.
+# ── Verify the kernel store can boot the committed tree ──────────────
+# Snapshots carry no kernels: stage 1 boots any snapshot with any UKI from
+# the store on the modules subvolume, so the only way to commit an
+# unbootable system is an empty store. Returns 1 after logging.
 # SYNC: copied in freshroot-update, freshroot-build and freshroot-install.
-bootable_kernel_present() {
-    local mod_dir kver ok=0 states=() s
-    for mod_dir in /usr/lib/modules/*/; do
-        [[ -d "$mod_dir" ]] || continue
-        kver=$(basename "$mod_dir")
-        if [[ ! -e "${BOOT_PARTITION}/vmlinuz-${kver}" ]]; then
-            states+=("${kver}: no ${BOOT_PARTITION}/vmlinuz-${kver}")
-        elif [[ ! -e "${BOOT_PARTITION}/initrd.img-${kver}" && \
-                ! -e "${BOOT_PARTITION}/initramfs-${kver}.img" ]]; then
-            states+=("${kver}: no initrd in ${BOOT_PARTITION}")
-        else
+uki_store_ok() {
+    local ukidir="${TOPLEVEL}/${MODULES_SUBVOL}/.freshroot/uki" f k ok=0
+    for f in "${ukidir}"/uki-*.efi; do
+        [[ -s "$f" ]] || continue
+        k="${f##*/uki-}"; k="${k%.efi}"
+        if [[ -d "${TOPLEVEL}/${MODULES_SUBVOL}/${k}" ]]; then
             ok=1
+        else
+            warn "  ${k}: UKI without a module tree on ${MODULES_SUBVOL}"
         fi
     done
     [[ $ok -eq 1 ]] && return 0
-    warn "no kernel in /usr/lib/modules has a vmlinuz + initrd pair in ${BOOT_PARTITION}"
-    for s in "${states[@]}"; do warn "  ${s}"; done
-    [[ ${#states[@]} -gt 0 ]] || warn "  (no kernel modules in /usr/lib/modules at all)"
+    warn "kernel store ${MODULES_SUBVOL}/.freshroot/uki holds no UKI with a matching module tree"
     return 1
+}
+# ── Refresh UKIs after a commit ──────────────────────────────────────
+# The initramfs userspace comes from the newest snapshot; after a commit
+# the store's UKIs are rebuilt when that changed anything dracut cares
+# about. Our flock (fd 9) is inherited — tell freshroot-kernel not to take
+# it again.
+# SYNC: copied in freshroot-update, freshroot-build and freshroot-install.
+rebuild_ukis_if_stale() {
+    command -v freshroot-kernel >/dev/null 2>&1 \
+        || { warn "freshroot-kernel not installed — UKIs not refreshed"; return 0; }
+    info "refreshing kernel UKIs against the newest snapshot"
+    _FRESHROOT_LOCK_HELD=1 freshroot-kernel rebuild --if-stale 2>&1 | tee -a "$LOG_FILE" \
+        || warn "UKI rebuild failed — snapshots still boot with the existing UKIs"
 }
 
 # ── Run updates inside nspawn container ──────────────────────────────
@@ -548,7 +540,6 @@ suppress_staging_update_grub "$STAGING_PATH"
 
 if [[ $INTERACTIVE -eq 1 ]]; then
     info "entering interactive nspawn shell — exit 0 to snapshot, non-zero to abort"
-    info "(update-grub is disabled inside staging; the host runs it after commit)"
 
     NSPAWN_ARGS=(
         --directory="$STAGING_PATH"
@@ -693,48 +684,16 @@ while IFS= read -r repo; do
     fi
 done <<< "${_FRESHROOT_REPOS:-}"
 
-# ── Repair missing kernel files in /boot ─────────────────────────────
-# GRUB pairs a snapshot only with kernels whose vmlinuz AND initrd exist in
-# the shared /boot. A kernel whose files went missing there (a failed initrd
-# build, manual cleanup, a foreign tool's autoremove) is still "installed"
-# as far as apt is concerned, so nothing would ever put them back — and
-# every later clone of this tree would inherit the gap.
-for mod_dir in /usr/lib/modules/*/; do
-    kver="${mod_dir%/}"; kver="${kver##*/}"
-    # Only kernels a package still owns; leftover module dirs are skipped.
-    pkg=$(dpkg -S "/boot/vmlinuz-${kver}" 2>/dev/null | head -1 | cut -d: -f1) || pkg=""
-    [ -n "$pkg" ] || continue
-    if [ ! -e "/boot/vmlinuz-${kver}" ]; then
-        echo "==> /boot/vmlinuz-${kver} missing — reinstalling ${pkg}"
-        apt-get install -y --reinstall "$pkg" \
-            || echo "WARNING: reinstall of ${pkg} failed" >&2
-    fi
-    if [ ! -e "/boot/initrd.img-${kver}" ] && [ ! -e "/boot/initramfs-${kver}.img" ]; then
-        echo "==> no initrd for ${kver} in /boot — regenerating"
-        if command -v dracut >/dev/null 2>&1; then
-            dracut -f "/boot/initrd.img-${kver}" "${kver}" \
-                || echo "WARNING: dracut failed for ${kver}" >&2
-        elif command -v update-initramfs >/dev/null 2>&1; then
-            update-initramfs -c -k "${kver}" \
-                || echo "WARNING: update-initramfs failed for ${kver}" >&2
-        fi
-    fi
-done
-
 INNER
 fi
 
 restore_staging_update_grub "$STAGING_PATH"
 
-# Unmount boot/EFI before snapshotting
-umount -R "${STAGING_PATH}${BOOT_PARTITION}" 2>/dev/null || true
-
 if [[ $NSPAWN_RC -ne 0 ]]; then
     die "nspawn update failed (exit $NSPAWN_RC) — staging retained at ${STAGING_SUBVOL}"
 fi
 
-bootable_kernel_present \
-    || die "refusing to commit a tree GRUB could not boot — staging retained at ${STAGING_SUBVOL}; check free space in ${BOOT_PARTITION} and the kernel/dracut output above"
+uki_store_ok || die "refusing to commit — the kernel store is empty; run 'freshroot-kernel add' or 'freshroot-kernel adopt' first (staging retained at ${STAGING_SUBVOL})"
 
 # ── Determine the lineage label for the new snapshot ─────────────────
 # --lineage wins; a custom source label (name label that differs from the
@@ -773,10 +732,8 @@ ensure_default_lineage "$CUR_LINEAGE"
 # ── Prune old snapshots ─────────────────────────────────────────────
 prune_snapshots
 
-# ── Update GRUB to pick up the new snapshot ──────────────────────────
-# 06_freshroot self-mounts /.snapshots when needed.
-info "regenerating GRUB configuration"
-update-grub 2>&1 | tee -a "$LOG_FILE" || warn "update-grub failed"
+# ── Refresh the kernel store against the new snapshot ────────────────
+rebuild_ukis_if_stale
 
 info "=== freshroot-update completed successfully ==="
 info "New snapshot ${NEW_NAME} is ready. Reboot to apply."
