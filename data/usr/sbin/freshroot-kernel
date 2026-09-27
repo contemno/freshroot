@@ -1,0 +1,734 @@
+#!/bin/bash
+# /usr/sbin/freshroot-kernel
+# Apt-free kernel management for freshroot.
+#
+# Kernels live in a STORE on the persistent modules subvolume, never inside
+# snapshot trees: freshroot-kernel fetches mainline builds (or ingests local
+# artifacts), places the module tree on the subvolume, builds an initramfs
+# with dracut inside an nspawn clone of the newest snapshot, and compiles
+# kernel + initramfs into a UKI that the stage-1 boot menu kexecs. Any
+# kernel boots any snapshot.
+#
+# Store layout (on MODULES_SUBVOL, mounted at /usr/lib/modules):
+#   <kver>/                          module tree
+#   .freshroot/dist/vmlinuz-<kver>   kernel image, kept for rebuilds
+#   .freshroot/uki/uki-<kver>.efi    boot artifact read by stage 1
+#   .freshroot/uki/uki-<kver>.meta   build metadata, KEY=value lines
+# The dot-dir keeps the store invisible to /usr/lib/modules/*/ globs —
+# kernel hooks, dkms and freshroot's own gates enumerate kvers that way.
+#
+# NOTE: die/info/warn, resolve_btrfs_device and the lineage helpers this
+# tool needs (snap_ts, snap_label, lineage_of_root, snapshot_lineage,
+# list_ro_snapshots) are intentionally COPIED from /usr/sbin/freshroot-update
+# (the tools must not share a library). Fix a bug in every copy.
+set -euo pipefail
+
+usage() {
+    cat <<'USAGE'
+Usage: freshroot-kernel <command> [options]
+
+Commands:
+  add --mainline <ver>|--latest   Fetch a kernel.ubuntu.com mainline build
+                                  (e.g. 6.16.9) into the store and build its UKI.
+  add --deb <image.deb> --deb <modules.deb>
+                                  Ingest local kernel debs (mainline-style).
+  add --vmlinuz <file> --modules <dir> [--kver <k>]
+                                  Ingest a raw kernel image + module tree.
+  adopt [<kver>|--all]            Import an apt-installed kernel whose modules
+                                  already sit on the modules subvolume (default:
+                                  the running kernel) — the migration entry point.
+  list [--remote]                 Show the store (and, with --remote, the newest
+                                  mainline builds that offer this arch).
+  remove <kver> [--force]         Delete a kernel from the store.
+  rebuild [<kver>|--all] [--if-stale]
+                                  Rebuild initramfs + UKI (--if-stale: only when
+                                  the newest snapshot or dracut config changed).
+  gc                              Keep the newest KERNEL_KEEP kernels (and the
+                                  running one), remove the rest.
+
+Options:
+  --flavour <name>   Kernel flavour (default: KERNEL_FLAVOUR, "generic")
+  --arch <arch>      Package architecture (default: KERNEL_ARCH, "amd64")
+  --require-checksums  Fail when the mirror publishes no checksum for a deb
+  --require-gpg      Fail unless CHECKSUMS carries a valid kernel-ppa signature
+  --force            Overwrite an existing kernel / remove the running kernel
+USAGE
+}
+
+SUB=""
+OPT_MAINLINE=""; OPT_LATEST=0; OPT_DEBS=(); OPT_VMLINUZ=""; OPT_MODULES=""; OPT_KVER=""
+OPT_ALL=0; OPT_FORCE=0; OPT_IF_STALE=0; OPT_REMOTE=0
+OPT_REQUIRE_CHECKSUMS=0; OPT_REQUIRE_GPG=0; OPT_FLAVOUR=""; OPT_ARCH=""
+POSITIONAL=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        add|adopt|list|remove|rebuild|gc|stage1|sb-status)
+            [[ -z "$SUB" ]] || { echo "freshroot-kernel: only one command may be given" >&2; exit 1; }
+            SUB="$1" ;;
+        --mainline)  [[ $# -ge 2 ]] || { echo "--mainline requires a version" >&2; exit 1; }; OPT_MAINLINE="$2"; shift ;;
+        --mainline=*) OPT_MAINLINE="${1#*=}" ;;
+        --latest)    OPT_LATEST=1 ;;
+        --deb)       [[ $# -ge 2 ]] || { echo "--deb requires a file" >&2; exit 1; }; OPT_DEBS+=("$2"); shift ;;
+        --vmlinuz)   [[ $# -ge 2 ]] || { echo "--vmlinuz requires a file" >&2; exit 1; }; OPT_VMLINUZ="$2"; shift ;;
+        --modules)   [[ $# -ge 2 ]] || { echo "--modules requires a directory" >&2; exit 1; }; OPT_MODULES="$2"; shift ;;
+        --kver)      [[ $# -ge 2 ]] || { echo "--kver requires a version" >&2; exit 1; }; OPT_KVER="$2"; shift ;;
+        --flavour)   [[ $# -ge 2 ]] || { echo "--flavour requires a name" >&2; exit 1; }; OPT_FLAVOUR="$2"; shift ;;
+        --arch)      [[ $# -ge 2 ]] || { echo "--arch requires a name" >&2; exit 1; }; OPT_ARCH="$2"; shift ;;
+        --all)       OPT_ALL=1 ;;
+        --force)     OPT_FORCE=1 ;;
+        --if-stale)  OPT_IF_STALE=1 ;;
+        --remote)    OPT_REMOTE=1 ;;
+        --require-checksums) OPT_REQUIRE_CHECKSUMS=1 ;;
+        --require-gpg) OPT_REQUIRE_GPG=1 ;;
+        -h|--help)   usage; exit 0 ;;
+        -*)          echo "freshroot-kernel: unknown option: $1" >&2; exit 1 ;;
+        *)           POSITIONAL+=("$1") ;;
+    esac
+    shift
+done
+[[ -n "$SUB" ]] || { usage >&2; exit 1; }
+
+CONF="/etc/freshroot-update.conf"
+[[ -f "$CONF" ]] || { echo "ERROR: config not found at $CONF" >&2; exit 1; }
+# Defaults for keys the (conffile-preserved) config may predate
+# shellcheck disable=SC2034  # array syntax used by the conf, not read here
+LINEAGE_QUOTAS=()
+MODULES_SUBVOL="@modules"
+FIRMWARE_SUBVOL="@firmware"
+KERNEL_KEEP=3
+MAINLINE_MIRROR="https://kernel.ubuntu.com/mainline"
+KERNEL_FLAVOUR="generic"
+KERNEL_ARCH="amd64"
+# shellcheck source=/dev/null
+source "$CONF"
+BOOT_PARTITION="${BOOT_PARTITION:-/boot}"
+EFI_PARTITION="${EFI_PARTITION:-/boot/efi}"
+LOG_DIR="${LOG_DIR:-/var/log/freshroot-update}"
+SNAPSHOTS_DIR="${SNAPSHOTS_DIR:-@snapshots}"
+[[ -n "$OPT_FLAVOUR" ]] && KERNEL_FLAVOUR="$OPT_FLAVOUR"
+[[ -n "$OPT_ARCH" ]] && KERNEL_ARCH="$OPT_ARCH"
+
+# ── Globals ──────────────────────────────────────────────────────────
+TOPLEVEL="/run/freshroot-kernel/btrfs-toplevel"
+TS="$(date -u +%Y%m%dT%H%M%S)"
+# Shared with freshroot-update/-build/-install so store changes never race
+# a staging run (they invoke this tool as a hook while holding the lock and
+# export _FRESHROOT_LOCK_HELD=1 so it does not deadlock on itself).
+LOCKFILE="/run/freshroot-update.lock"
+LOG_FILE="${LOG_DIR}/kernel-${TS}.log"
+KSTAGE_SUBVOL="@kernelstage"
+KERNEL_PPA_KEY="/usr/share/freshroot/kernel-ppa.asc"
+WORK=""
+KSTAGE=""
+
+# ── Helpers ──────────────────────────────────────────────────────────
+die()  { echo "FATAL: $*" | tee -a "$LOG_FILE" >&2; exit 1; }
+info() { echo "[$(date -u +%H:%M:%S)] $*" | tee -a "$LOG_FILE"; }
+warn() { echo "[$(date -u +%H:%M:%S)] WARNING: $*" | tee -a "$LOG_FILE" >&2; }
+
+cleanup() {
+    local rc=$?
+    if [[ -n "$KSTAGE" ]] && btrfs subvolume show "$KSTAGE" &>/dev/null; then
+        btrfs subvolume delete "$KSTAGE" >/dev/null 2>&1 || true
+    fi
+    if [[ -n "$WORK" && -d "$WORK" ]]; then
+        rm -rf "${WORK:?}"
+    fi
+    mountpoint -q "$TOPLEVEL" 2>/dev/null && umount -l "$TOPLEVEL"
+    [[ $rc -ne 0 ]] && info "freshroot-kernel FAILED (exit $rc)"
+    exit $rc
+}
+trap cleanup EXIT
+
+# ── Lineage helpers (SYNC: copied from freshroot-update) ─────────────
+snap_ts() {
+    local name="${1##*/}" last
+    name="${name#root.}"
+    last="${name##*.}"
+    if [[ "$last" =~ ^[0-9]{8}T[0-9]{6}$ ]]; then
+        echo "$last"
+    fi
+}
+
+snap_label() {
+    local name="${1##*/}" last
+    name="${name#root.}"
+    last="${name##*.}"
+    if [[ "$last" =~ ^[0-9]{8}T[0-9]{6}$ && "$name" == *.* ]]; then
+        echo "${name%.*}"
+    fi
+}
+
+lineage_of_root() {
+    local root="$1" f="" tgt id="" ver=""
+    if [[ -r "${root}/usr/lib/os-release" && ! -L "${root}/usr/lib/os-release" ]]; then
+        f="${root}/usr/lib/os-release"
+    elif [[ -L "${root}/etc/os-release" ]]; then
+        tgt=$(readlink "${root}/etc/os-release" 2>/dev/null) || tgt=""
+        case "$tgt" in
+            /*) [[ -r "${root}${tgt}" ]] && f="${root}${tgt}" ;;
+            *)  [[ -r "${root}/etc/os-release" ]] && f="${root}/etc/os-release" ;;
+        esac
+    elif [[ -r "${root}/etc/os-release" ]]; then
+        f="${root}/etc/os-release"
+    fi
+    if [[ -n "$f" ]]; then
+        id=$(sed -n 's/^ID=//p' "$f" | head -1 | tr -d '"' \
+             | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9._-')
+        ver=$(sed -n 's/^VERSION_ID=//p' "$f" | head -1 | tr -d '"' \
+              | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9._-')
+    fi
+    if [[ -n "$id" && -n "$ver" ]]; then
+        echo "${id}-${ver}"
+    elif [[ -n "$id" ]]; then
+        echo "$id"
+    else
+        echo "unknown"
+    fi
+}
+
+snapshot_lineage() {
+    local snap="${1%/}" label
+    label=$(snap_label "$snap")
+    if [[ -n "$label" ]]; then
+        echo "$label"
+    else
+        lineage_of_root "$snap"
+    fi
+}
+
+# List read-only snapshots as "TS<TAB>lineage<TAB>path" lines, TS-sorted
+# oldest-first. Names without a valid TS field are omitted.
+list_ro_snapshots() {
+    local d ts lin
+    for d in "${SNAP_PATH}"/*/; do
+        [[ -d "$d" ]] || continue
+        btrfs property get "$d" ro 2>/dev/null | grep -q 'ro=true' || continue
+        ts=$(snap_ts "${d%/}")
+        [[ -n "$ts" ]] || continue
+        lin=$(snapshot_lineage "${d%/}")
+        printf '%s\t%s\t%s\n' "$ts" "$lin" "${d%/}"
+    done | sort
+}
+
+# Newest read-only snapshot across all lineages (path), '' if none.
+newest_snapshot() {
+    list_ro_snapshots | tail -1 | cut -f3
+}
+
+resolve_btrfs_device() {
+    local dev
+    dev=$(findmnt -n -o SOURCE / | head -1)
+    dev="${dev%%\[*}"
+    [[ -n "$dev" ]] || die "cannot determine btrfs device for /"
+    echo "$dev"
+}
+
+# ── Pure helpers (unit-tested; no filesystem side effects) ───────────
+
+# Version directories in a mainline index page, stable releases only,
+# ascending. Input: index HTML on stdin.
+mainline_versions_from_index() {
+    grep -oE 'href="v[0-9]+\.[0-9]+(\.[0-9]+)?/"' | sed 's/^href="v//; s/\/"$//' | sort -V | uniq
+}
+
+# Relative deb path (arch/name.deb) of the image or modules package for
+# the configured arch+flavour in a version-directory index page.
+# $1 = image|modules, index HTML on stdin. Empty when absent.
+mainline_deb_from_index() {
+    local kind="$1" pat
+    case "$kind" in
+        image)   pat="linux-image-unsigned-[^\"/]*-${KERNEL_FLAVOUR}_[^\"/]*_${KERNEL_ARCH}\\.deb" ;;
+        modules) pat="linux-modules-[^\"/]*-${KERNEL_FLAVOUR}_[^\"/]*_${KERNEL_ARCH}\\.deb" ;;
+        *) return 1 ;;
+    esac
+    grep -oE "href=\"${KERNEL_ARCH}/${pat}\"" | sed 's/^href="//; s/"$//' | head -1
+}
+
+# sha256 for a basename from a CHECKSUMS file (its Checksums-Sha256 block),
+# '' when the file does not list it. $1 = CHECKSUMS path, $2 = basename.
+checksum_for() {
+    awk -v want="$2" '
+        /Checksums-Sha256/ { sha=1; next }
+        sha && $1 ~ /^[0-9a-f]{64}$/ { n=$2; sub(/^.*\//, "", n); if (n == want) { print $1; exit } }
+    ' "$1"
+}
+
+# Kernel version of an extracted deb tree: the single directory under
+# lib/modules or usr/lib/modules. $1 = extraction root.
+kver_of_extracted() {
+    local d base=""
+    for base in "$1/lib/modules" "$1/usr/lib/modules"; do
+        [[ -d "$base" ]] || continue
+        for d in "$base"/*/; do
+            [[ -d "$d" ]] || continue
+            basename "$d"
+        done
+    done | sort -u
+}
+
+# Kernels to drop under gc: all but the newest $2 of the newline-separated
+# kver list $1, never the running kver $3. Output: kvers to remove.
+gc_victims() {
+    local keep="$2" running="$3" kv
+    printf '%s\n' "$1" | grep . | sort -V | head -n -"$keep" | while read -r kv; do
+        [[ "$kv" == "$running" ]] && continue
+        echo "$kv"
+    done
+}
+
+# ── Sanity ───────────────────────────────────────────────────────────
+[[ $(id -u) -eq 0 ]] || die "must be run as root"
+if [[ "${_FRESHROOT_LOCK_HELD:-0}" != "1" ]]; then
+    exec 9>"$LOCKFILE"
+    flock -n 9 || die "another freshroot-update/-build/-install/-kernel is running"
+fi
+mkdir -p "$LOG_DIR"
+info "=== freshroot-kernel ${SUB} started ==="
+
+BTRFS_DEV=$(resolve_btrfs_device)
+mkdir -p "$TOPLEVEL"
+mount -t btrfs -o subvolid=5 "$BTRFS_DEV" "$TOPLEVEL" || die "failed to mount top-level"
+
+SNAP_PATH="${TOPLEVEL}/${SNAPSHOTS_DIR}"
+MODULES_PATH="${TOPLEVEL}/${MODULES_SUBVOL}"
+FIRMWARE_PATH="${TOPLEVEL}/${FIRMWARE_SUBVOL}"
+STORE="${MODULES_PATH}/.freshroot"
+DIST="${STORE}/dist"
+UKIDIR="${STORE}/uki"
+KSTAGE="${TOPLEVEL}/${KSTAGE_SUBVOL}"
+
+btrfs subvolume show "$MODULES_PATH" &>/dev/null \
+    || die "modules subvolume ${MODULES_SUBVOL} not found at the btrfs top level — create it and mount it at /usr/lib/modules first (see README: Kernel management)"
+if ! findmnt -n -o SOURCE /usr/lib/modules 2>/dev/null | grep -q "\[/${MODULES_SUBVOL}\]"; then
+    warn "/usr/lib/modules is not mounted from ${MODULES_SUBVOL} on this system — the store is still managed on the subvolume"
+fi
+mkdir -p "$DIST" "$UKIDIR"
+RUNNING_KVER=$(uname -r)
+
+# ── Store metadata ───────────────────────────────────────────────────
+meta_file() { echo "${UKIDIR}/uki-$1.meta"; }
+meta_get() { # kver key
+    local f; f=$(meta_file "$1")
+    [[ -r "$f" ]] || return 0
+    sed -n "s/^$2=//p" "$f" | head -1
+}
+# write_meta kver KEY=VALUE... — rewrites the file from the given pairs
+write_meta() {
+    local kver="$1"; shift
+    printf '%s\n' "$@" > "$(meta_file "$kver").tmp"
+    mv -f "$(meta_file "$kver").tmp" "$(meta_file "$kver")"
+}
+
+# Inputs to the initramfs that live in the build tree: dracut config plus
+# freshroot's own dracut module. Changing any of them makes UKIs stale.
+tree_dracut_hash() {
+    cat "$1"/etc/dracut.conf "$1"/etc/dracut.conf.d/* "$1"/usr/lib/dracut/dracut.conf.d/* \
+        "$1"/usr/lib/dracut/modules.d/90freshroot/* 2>/dev/null | sha256sum | cut -d' ' -f1
+}
+
+have_modules() { [[ -f "${MODULES_PATH}/$1/modules.order" || -d "${MODULES_PATH}/$1/kernel" ]]; }
+have_uki() { [[ -s "${UKIDIR}/uki-$1.efi" ]]; }
+
+# Every kver present in the store (modules dir or dist image), sorted -V.
+store_kvers() {
+    { for d in "${MODULES_PATH}"/*/; do [[ -d "$d" ]] && basename "$d"; done
+      for f in "${DIST}"/vmlinuz-*; do [[ -f "$f" ]] && echo "${f##*/vmlinuz-}"; done; } 2>/dev/null \
+      | grep -v '^\.' | sort -uV
+}
+
+# A kver is "bootable" when its UKI and its module tree both exist —
+# the currency of the tools' commit gate.
+bootable_kvers() {
+    local k
+    for k in $(store_kvers); do
+        have_uki "$k" && have_modules "$k" && echo "$k"
+    done
+}
+
+# ── UKI build: dracut + ukify inside an nspawn clone of the newest snapshot ──
+kstage_create() {
+    local snap="$1"
+    if btrfs subvolume show "$KSTAGE" &>/dev/null; then
+        warn "stale ${KSTAGE_SUBVOL} found — deleting"
+        btrfs subvolume delete "$KSTAGE" >/dev/null || die "cannot delete stale ${KSTAGE_SUBVOL}"
+    fi
+    btrfs subvolume snapshot "$snap" "$KSTAGE" >/dev/null || die "failed to clone ${snap##*/} to ${KSTAGE_SUBVOL}"
+}
+kstage_delete() {
+    btrfs subvolume delete "$KSTAGE" >/dev/null 2>&1 || warn "could not delete ${KSTAGE_SUBVOL}"
+}
+
+META_SOURCE=""
+META_MAINLINE_VER=""
+
+build_uki() {
+    local kver="$1" snap snapname rc=0 pkgver
+    [[ -f "${DIST}/vmlinuz-${kver}" ]] || die "no ${DIST}/vmlinuz-${kver} to build from"
+    have_modules "$kver" || die "no module tree for ${kver} on ${MODULES_SUBVOL}"
+    snap=$(newest_snapshot)
+    [[ -n "$snap" ]] || die "no read-only snapshot to build the initramfs from"
+    snapname="${snap##*/}"
+    info "building UKI for ${kver} in a clone of ${snapname}"
+    kstage_create "$snap"
+    [[ -x "${KSTAGE}/usr/bin/ukify" || -x "${KSTAGE}/usr/lib/systemd/ukify" ]] \
+        || die "${snapname} lacks systemd-ukify — run freshroot-update once so a snapshot carries the current freshroot deb and its dependencies"
+    [[ -x "${KSTAGE}/usr/bin/dracut" ]] || die "${snapname} lacks dracut"
+
+    WORK=$(mktemp -d /var/tmp/freshroot-kernel.XXXXXX)
+    cp "${DIST}/vmlinuz-${kver}" "${WORK}/vmlinuz"
+    local binds=("--bind=${MODULES_PATH}:/usr/lib/modules" "--bind=${WORK}:/run/freshroot-kernel-work")
+    if btrfs subvolume show "$FIRMWARE_PATH" &>/dev/null; then
+        binds+=("--bind=${FIRMWARE_PATH}:/usr/lib/firmware")
+    fi
+    export SYSTEMD_SECCOMP=0
+    # --no-hostonly: inside a container dracut would tailor the image to the
+    # container's (empty) device view; the initramfs must boot real hardware.
+    systemd-nspawn \
+        --directory="$KSTAGE" \
+        --resolv-conf=bind-stub \
+        --setenv=DEBIAN_FRONTEND=noninteractive \
+        --setenv=KVER="$kver" \
+        "${binds[@]}" \
+        --quiet \
+        --console=pipe \
+        /bin/bash -e <<'INNER' 2>&1 | tee -a "$LOG_FILE" || rc=${PIPESTATUS[0]}
+depmod "$KVER"
+dracut --force --no-hostonly --no-hostonly-cmdline --kver "$KVER" \
+    /run/freshroot-kernel-work/initrd.img
+ukify build \
+    --linux /run/freshroot-kernel-work/vmlinuz \
+    --initrd /run/freshroot-kernel-work/initrd.img \
+    --uname "$KVER" \
+    --cmdline "ro rd.freshroot=1" \
+    --output /run/freshroot-kernel-work/uki.efi
+INNER
+    [[ $rc -eq 0 && -s "${WORK}/uki.efi" ]] || die "UKI build failed for ${kver} (exit ${rc})"
+    # shellcheck disable=SC2016  # dpkg-query format string, not a shell expansion
+    pkgver=$(chroot "$KSTAGE" dpkg-query -W -f '${Version}' freshroot 2>/dev/null || echo unknown)
+    local hash; hash=$(tree_dracut_hash "$KSTAGE")
+    kstage_delete
+
+    cp "${WORK}/uki.efi" "${UKIDIR}/.uki-${kver}.efi.tmp"
+    mv -f "${UKIDIR}/.uki-${kver}.efi.tmp" "${UKIDIR}/uki-${kver}.efi"
+    local source mver
+    source="${META_SOURCE:-$(meta_get "$kver" SOURCE)}"
+    mver="${META_MAINLINE_VER:-$(meta_get "$kver" MAINLINE_VER)}"
+    write_meta "$kver" \
+        "KVER=${kver}" \
+        "SOURCE=${source:-unknown}" \
+        "MAINLINE_VER=${mver}" \
+        "SHA256_VMLINUZ=$(sha256sum "${DIST}/vmlinuz-${kver}" | cut -d' ' -f1)" \
+        "BUILT_FROM_SNAPSHOT=${snapname}" \
+        "DRACUT_CONF_HASH=${hash}" \
+        "FRESHROOT_PKG_VERSION=${pkgver}" \
+        "BUILD_TS=$(date -u +%Y%m%dT%H%M%S)" \
+        "STAGE1=$(meta_get "$kver" STAGE1)"
+    rm -rf "${WORK:?}"; WORK=""
+    info "UKI ready: ${UKIDIR#"$TOPLEVEL"/}/uki-${kver}.efi"
+}
+
+# Stale when the UKI or its metadata is missing, the newest snapshot has
+# changed since the build, or the dracut inputs in that snapshot differ.
+is_stale() {
+    local kver="$1" snap
+    have_uki "$kver" || return 0
+    [[ -r "$(meta_file "$kver")" ]] || return 0
+    snap=$(newest_snapshot)
+    [[ -n "$snap" ]] || return 1
+    [[ "$(meta_get "$kver" BUILT_FROM_SNAPSHOT)" == "${snap##*/}" ]] || return 0
+    [[ "$(meta_get "$kver" DRACUT_CONF_HASH)" == "$(tree_dracut_hash "$snap")" ]] || return 0
+    return 1
+}
+
+# ── Acquisition ──────────────────────────────────────────────────────
+fetch() { # url dest
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL --retry 3 -o "$2" "$1"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q -O "$2" "$1"
+    else
+        die "neither curl nor wget is installed"
+    fi
+}
+
+# Newest stable mainline version that offers an image deb for this arch
+# (builds fail per-arch, so the newest directory is not always usable).
+latest_mainline() {
+    local v tries=0 idx
+    fetch "${MAINLINE_MIRROR}/" "${WORK}/index.html" || die "cannot read ${MAINLINE_MIRROR}/"
+    for v in $(mainline_versions_from_index < "${WORK}/index.html" | tac); do
+        tries=$((tries + 1)); [[ $tries -le 12 ]] || break
+        fetch "${MAINLINE_MIRROR}/v${v}/" "${WORK}/vindex.html" 2>/dev/null || continue
+        idx=$(mainline_deb_from_index image < "${WORK}/vindex.html")
+        [[ -n "$idx" ]] || continue
+        echo "$v"
+        return 0
+    done
+    return 1
+}
+
+# Downloads image + modules debs for mainline version $1 into $WORK;
+# echoes the two local paths.
+fetch_mainline() {
+    local ver="${1#v}" base image modules f sum have_sums=0
+    base="${MAINLINE_MIRROR}/v${ver}"
+    info "fetching mainline v${ver} (${KERNEL_ARCH}/${KERNEL_FLAVOUR}) from ${base}/"
+    fetch "${base}/" "${WORK}/vindex.html" || die "mainline v${ver} not found at ${base}/"
+    image=$(mainline_deb_from_index image < "${WORK}/vindex.html")
+    modules=$(mainline_deb_from_index modules < "${WORK}/vindex.html")
+    [[ -n "$image" && -n "$modules" ]] \
+        || die "mainline v${ver} has no ${KERNEL_ARCH} ${KERNEL_FLAVOUR} build (image/modules debs missing — builds fail per-arch)"
+    for f in "$image" "$modules"; do
+        info "  downloading ${f##*/}"
+        fetch "${base}/${f}" "${WORK}/${f##*/}" || die "download failed: ${base}/${f}"
+    done
+    # Integrity: the mirror's CHECKSUMS (GPG-signed) lists the debs on older
+    # builds; newer ones list only the git bundle, leaving TLS as the sole
+    # guarantee unless --require-checksums insists.
+    if fetch "${base}/CHECKSUMS" "${WORK}/CHECKSUMS" 2>/dev/null; then
+        if fetch "${base}/CHECKSUMS.gpg" "${WORK}/CHECKSUMS.gpg" 2>/dev/null \
+           && command -v gpg >/dev/null 2>&1 && [[ -r "$KERNEL_PPA_KEY" ]]; then
+            local kr="${WORK}/keyring.gpg"
+            if gpg --no-default-keyring --keyring "$kr" --import "$KERNEL_PPA_KEY" >/dev/null 2>&1 \
+               && gpg --no-default-keyring --keyring "$kr" --verify "${WORK}/CHECKSUMS.gpg" "${WORK}/CHECKSUMS" >/dev/null 2>&1; then
+                info "  CHECKSUMS signature verified against ${KERNEL_PPA_KEY##*/}"
+            else
+                [[ $OPT_REQUIRE_GPG -eq 1 ]] && die "CHECKSUMS signature verification failed"
+                warn "CHECKSUMS signature could not be verified"
+            fi
+        elif [[ $OPT_REQUIRE_GPG -eq 1 ]]; then
+            die "--require-gpg: no CHECKSUMS.gpg, gpg or ${KERNEL_PPA_KEY} available"
+        fi
+        for f in "$image" "$modules"; do
+            sum=$(checksum_for "${WORK}/CHECKSUMS" "${f##*/}")
+            if [[ -n "$sum" ]]; then
+                echo "${sum}  ${f##*/}" | (cd "$WORK" && sha256sum -c --quiet -) \
+                    || die "sha256 mismatch for ${f##*/}"
+                have_sums=1
+            fi
+        done
+    fi
+    if [[ $have_sums -eq 1 ]]; then
+        info "  sha256 verified against CHECKSUMS"
+    elif [[ $OPT_REQUIRE_CHECKSUMS -eq 1 ]]; then
+        die "--require-checksums: the mirror publishes no checksum for these debs"
+    else
+        warn "mirror publishes no checksums for these debs — integrity rests on TLS (sha256 recorded in .meta)"
+    fi
+    echo "${WORK}/${image##*/}"
+    echo "${WORK}/${modules##*/}"
+}
+
+# Extracts debs into $WORK/x; sets ING_KVER, ING_VMLINUZ, ING_MODDIR.
+ingest_debs() {
+    local deb
+    mkdir -p "${WORK}/x"
+    for deb in "$@"; do
+        [[ -f "$deb" ]] || die "no such deb: $deb"
+        info "  extracting ${deb##*/}"
+        dpkg-deb -x "$deb" "${WORK}/x" || die "dpkg-deb -x failed for ${deb##*/}"
+    done
+    local kvers n
+    kvers=$(kver_of_extracted "${WORK}/x")
+    n=$(printf '%s\n' "$kvers" | grep -c .) || n=0
+    [[ "$n" -eq 1 ]] || die "expected exactly one kernel version in the debs, found ${n}: ${kvers//$'\n'/ }"
+    ING_KVER="$kvers"
+    ING_VMLINUZ="${WORK}/x/boot/vmlinuz-${ING_KVER}"
+    [[ -f "$ING_VMLINUZ" ]] || die "image deb carries no /boot/vmlinuz-${ING_KVER}"
+    if [[ -d "${WORK}/x/lib/modules/${ING_KVER}" ]]; then
+        ING_MODDIR="${WORK}/x/lib/modules/${ING_KVER}"
+    else
+        ING_MODDIR="${WORK}/x/usr/lib/modules/${ING_KVER}"
+    fi
+}
+
+# Places the module tree and kernel image into the store.
+install_kernel() {
+    local kver="$1" vmlinuz="$2" moddir="$3"
+    if [[ -d "${MODULES_PATH}/${kver}" ]]; then
+        [[ $OPT_FORCE -eq 1 ]] || die "${kver} already has a module tree on ${MODULES_SUBVOL} (use --force to replace it)"
+        rm -rf "${MODULES_PATH:?}/${kver:?}"
+    fi
+    [[ -d "$moddir" ]] || die "module directory not found: $moddir"
+    [[ -f "$vmlinuz" ]] || die "kernel image not found: $vmlinuz"
+    info "installing modules for ${kver} onto ${MODULES_SUBVOL}"
+    cp -a "$moddir" "${MODULES_PATH}/${kver}"
+    # Absolute build/source symlinks point into a tree that is not here
+    rm -f "${MODULES_PATH:?}/${kver:?}/build" "${MODULES_PATH:?}/${kver:?}/source"
+    install -m 0644 "$vmlinuz" "${DIST}/vmlinuz-${kver}"
+}
+
+# ── Commands ─────────────────────────────────────────────────────────
+cmd_add() {
+    WORK=$(mktemp -d /var/tmp/freshroot-kernel.XXXXXX)
+    local kver vmlinuz moddir
+    if [[ -n "$OPT_MAINLINE" || $OPT_LATEST -eq 1 ]]; then
+        local ver="$OPT_MAINLINE"
+        if [[ $OPT_LATEST -eq 1 ]]; then
+            ver=$(latest_mainline) || die "no mainline build with an ${KERNEL_ARCH} ${KERNEL_FLAVOUR} image among the newest releases"
+            info "newest mainline build for ${KERNEL_ARCH}: v${ver}"
+        fi
+        local debs; mapfile -t debs < <(fetch_mainline "$ver")
+        ingest_debs "${debs[@]}"
+        META_SOURCE=mainline; META_MAINLINE_VER="${ver#v}"
+        kver="$ING_KVER"; vmlinuz="$ING_VMLINUZ"; moddir="$ING_MODDIR"
+    elif [[ ${#OPT_DEBS[@]} -gt 0 ]]; then
+        ingest_debs "${OPT_DEBS[@]}"
+        META_SOURCE=deb
+        kver="$ING_KVER"; vmlinuz="$ING_VMLINUZ"; moddir="$ING_MODDIR"
+    elif [[ -n "$OPT_VMLINUZ" && -n "$OPT_MODULES" ]]; then
+        [[ -f "${OPT_MODULES}/modules.order" || -d "${OPT_MODULES}/kernel" ]] \
+            || die "--modules must point at a kernel module tree (…/lib/modules/<kver>)"
+        kver="${OPT_KVER:-$(basename "$OPT_MODULES")}"
+        vmlinuz="$OPT_VMLINUZ"; moddir="$OPT_MODULES"
+        META_SOURCE=raw
+    else
+        die "add needs --mainline <ver>, --latest, --deb … --deb …, or --vmlinuz + --modules"
+    fi
+    [[ "$kver" =~ ^[0-9]+\.[0-9]+[A-Za-z0-9._+-]*$ ]] || die "implausible kernel version: '${kver}'"
+    if have_uki "$kver" && [[ $OPT_FORCE -eq 0 ]]; then
+        die "${kver} is already in the store (use --force to replace it, or 'rebuild ${kver}')"
+    fi
+    install_kernel "$kver" "$vmlinuz" "$moddir"
+    rm -rf "${WORK:?}"; WORK=""
+    build_uki "$kver"
+    info "kernel ${kver} added"
+}
+
+cmd_adopt() {
+    local -a kvers=()
+    local k src
+    if [[ $OPT_ALL -eq 1 ]]; then
+        for k in $(store_kvers); do have_modules "$k" && kvers+=("$k"); done
+    elif [[ ${#POSITIONAL[@]} -gt 0 ]]; then
+        kvers=("${POSITIONAL[@]}")
+    else
+        kvers=("$RUNNING_KVER")
+    fi
+    [[ ${#kvers[@]} -gt 0 ]] || die "nothing to adopt"
+    for k in "${kvers[@]}"; do
+        have_modules "$k" || die "no module tree for ${k} on ${MODULES_SUBVOL} — adopt only imports kernels whose modules already live there"
+        if [[ ! -f "${DIST}/vmlinuz-${k}" ]]; then
+            src=""
+            for src in "${BOOT_PARTITION}/vmlinuz-${k}" "/boot/vmlinuz-${k}"; do
+                [[ -f "$src" ]] && break
+                src=""
+            done
+            [[ -n "$src" ]] || die "no vmlinuz-${k} found in ${BOOT_PARTITION} or /boot to adopt"
+            info "adopting ${k} from ${src}"
+            install -m 0644 "$src" "${DIST}/vmlinuz-${k}"
+        fi
+        META_SOURCE=adopt; META_MAINLINE_VER=""
+        build_uki "$k"
+    done
+}
+
+cmd_list() {
+    local k uki signed built src mark
+    printf '%-32s %-4s %-8s %-8s %-30s %s\n' KVER UKI SIGNED SOURCE BUILT_FROM FLAGS
+    for k in $(store_kvers); do
+        uki=no; have_uki "$k" && uki=yes
+        signed="-"
+        if have_uki "$k"; then
+            signed=no
+            [[ "$(meta_get "$k" SIGNED)" == "yes" ]] && signed=yes
+        fi
+        src=$(meta_get "$k" SOURCE); src="${src:-?}"
+        built=$(meta_get "$k" BUILT_FROM_SNAPSHOT); built="${built:--}"
+        mark=""
+        [[ "$k" == "$RUNNING_KVER" ]] && mark="${mark}running "
+        [[ "$(meta_get "$k" STAGE1)" == "yes" ]] && mark="${mark}stage1 "
+        have_modules "$k" || mark="${mark}NO-MODULES "
+        printf '%-32s %-4s %-8s %-8s %-30s %s\n' "$k" "$uki" "$signed" "$src" "$built" "$mark"
+    done
+    if [[ $OPT_REMOTE -eq 1 ]]; then
+        WORK=$(mktemp -d /var/tmp/freshroot-kernel.XXXXXX)
+        echo
+        echo "Newest mainline builds at ${MAINLINE_MIRROR}:"
+        fetch "${MAINLINE_MIRROR}/" "${WORK}/index.html" || die "cannot read ${MAINLINE_MIRROR}/"
+        mainline_versions_from_index < "${WORK}/index.html" | tail -8 | tac | while read -r v; do
+            if fetch "${MAINLINE_MIRROR}/v${v}/" "${WORK}/vindex.html" 2>/dev/null \
+               && [[ -n "$(mainline_deb_from_index image < "${WORK}/vindex.html")" ]]; then
+                echo "  v${v}  (${KERNEL_ARCH} ${KERNEL_FLAVOUR} available)"
+            else
+                echo "  v${v}  (no ${KERNEL_ARCH} build)"
+            fi
+        done
+    fi
+}
+
+remove_kernel_files() {
+    local k="$1"
+    rm -rf "${MODULES_PATH:?}/${k:?}"
+    rm -f "${DIST:?}/vmlinuz-${k}" "${UKIDIR:?}/uki-${k}.efi" "$(meta_file "$k")"
+}
+
+cmd_remove() {
+    [[ ${#POSITIONAL[@]} -eq 1 ]] || die "remove takes exactly one kernel version"
+    local k="${POSITIONAL[0]}" n
+    [[ -d "${MODULES_PATH}/${k}" || -f "${DIST}/vmlinuz-${k}" || -s "${UKIDIR}/uki-${k}.efi" ]] \
+        || die "${k} is not in the store"
+    if [[ "$k" == "$RUNNING_KVER" && $OPT_FORCE -eq 0 ]]; then
+        die "${k} is the running kernel (use --force)"
+    fi
+    n=$(bootable_kvers | grep -c .) || n=0
+    if have_uki "$k" && have_modules "$k" && [[ "$n" -le 1 ]]; then
+        die "${k} is the only bootable kernel in the store — add another before removing it"
+    fi
+    info "removing ${k} from the store"
+    local was_stage1; was_stage1=$(meta_get "$k" STAGE1)
+    remove_kernel_files "$k"
+    if [[ "$was_stage1" == "yes" ]]; then
+        warn "${k} was the stage-1 kernel — run 'freshroot-kernel stage1 --install' to rebuild stage 1 on another kernel"
+    fi
+}
+
+cmd_rebuild() {
+    local -a kvers=()
+    local k
+    if [[ ${#POSITIONAL[@]} -gt 0 ]]; then
+        kvers=("${POSITIONAL[@]}")
+    else
+        for k in $(store_kvers); do
+            [[ -f "${DIST}/vmlinuz-${k}" ]] && have_modules "$k" && kvers+=("$k")
+        done
+    fi
+    [[ ${#kvers[@]} -gt 0 ]] || { info "nothing to rebuild (store is empty)"; return 0; }
+    for k in "${kvers[@]}"; do
+        if [[ $OPT_IF_STALE -eq 1 ]] && ! is_stale "$k"; then
+            info "${k}: UKI is current"
+            continue
+        fi
+        build_uki "$k"
+    done
+}
+
+cmd_gc() {
+    local keep="${KERNEL_KEEP:-3}" k victims
+    [[ "$keep" =~ ^[0-9]+$ && "$keep" -ge 1 ]] || die "KERNEL_KEEP must be a positive integer (got '${keep}')"
+    victims=$(gc_victims "$(bootable_kvers)" "$keep" "$RUNNING_KVER")
+    if [[ -z "$victims" ]]; then
+        info "gc: nothing to remove (keeping newest ${keep})"
+        return 0
+    fi
+    for k in $victims; do
+        if [[ "$(meta_get "$k" STAGE1)" == "yes" ]]; then
+            info "gc: keeping ${k} (stage-1 kernel)"
+            continue
+        fi
+        info "gc: removing ${k}"
+        remove_kernel_files "$k"
+    done
+}
+
+case "$SUB" in
+    add)      cmd_add ;;
+    adopt)    cmd_adopt ;;
+    list)     cmd_list ;;
+    remove)   cmd_remove ;;
+    rebuild)  cmd_rebuild ;;
+    gc)       cmd_gc ;;
+    stage1|sb-status) die "'${SUB}' is not available in this build" ;;
+esac
+info "=== freshroot-kernel ${SUB} completed ==="

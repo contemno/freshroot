@@ -7,6 +7,7 @@ SETUP    := target/freshroot-setup
 SCRIPTS  := data/usr/sbin/freshroot-update \
             data/usr/sbin/freshroot-build \
             data/usr/sbin/freshroot-install \
+            data/usr/sbin/freshroot-kernel \
             installer/freshroot-setup \
             data/usr/lib/dracut/modules.d/90freshroot/module-setup.sh \
             data/usr/lib/dracut/modules.d/90freshroot/freshroot-setup.sh \
@@ -16,7 +17,8 @@ SCRIPTS  := data/usr/sbin/freshroot-update \
             data/usr/lib/dracut/modules.d/90freshroot-stage1/freshroot-menu-lib.sh \
             data/etc/grub.d/06_freshroot \
             test/pe-unit.sh \
-            test/menu-unit.sh
+            test/menu-unit.sh \
+            test/kernel-unit.sh
 # dracut hooks are sourced by dracut's /bin/sh init — checked in sh dialect
 SH_HOOKS  := data/usr/lib/dracut/modules.d/90freshroot-stage1/parse-freshroot-menu.sh \
             data/usr/lib/dracut/modules.d/90freshroot-stage1/mount-freshroot-menu.sh
@@ -45,6 +47,7 @@ lint:
 unit:
 	bash test/pe-unit.sh
 	bash test/menu-unit.sh
+	bash test/kernel-unit.sh
 
 clean:
 	rm -rf target
