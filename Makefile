@@ -18,7 +18,8 @@ SCRIPTS  := data/usr/sbin/freshroot-update \
             data/etc/grub.d/06_freshroot \
             test/pe-unit.sh \
             test/menu-unit.sh \
-            test/kernel-unit.sh
+            test/kernel-unit.sh \
+            test/sign-unit.sh
 # dracut hooks are sourced by dracut's /bin/sh init — checked in sh dialect
 SH_HOOKS  := data/usr/lib/dracut/modules.d/90freshroot-stage1/parse-freshroot-menu.sh \
             data/usr/lib/dracut/modules.d/90freshroot-stage1/mount-freshroot-menu.sh
@@ -48,6 +49,7 @@ unit:
 	bash test/pe-unit.sh
 	bash test/menu-unit.sh
 	bash test/kernel-unit.sh
+	bash test/sign-unit.sh
 
 clean:
 	rm -rf target
