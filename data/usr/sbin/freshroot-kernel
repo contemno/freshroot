@@ -52,6 +52,8 @@ Commands:
                                   WITHOUT changing the boot order; --test-next
                                   boots it once on the next reboot (BootNext);
                                   --make-default puts it first in BootOrder.
+  sb-status                       Report Secure Boot state, lockdown, the
+                                  signing key and each kernel's signature.
 
 Options:
   --flavour <name>   Kernel flavour (default: KERNEL_FLAVOUR, "generic")
@@ -60,6 +62,12 @@ Options:
   --require-gpg      Fail unless CHECKSUMS carries a valid kernel-ppa signature
   --force            Overwrite an existing kernel / remove the running kernel
   --test-keyfile <f> stage1: embed an unlock keyfile (QEMU rig only)
+
+Secure Boot: when SB_KEY_DIR holds db.key + db.crt (or SB_KEY_URI names a
+token key and db.crt is present), every kernel image is signed before it is
+wrapped and every UKI is signed after — the firmware verifies the stage-1
+UKI and the stage-2 kernel's kexec_file_load verifies the extracted kernel.
+Without a key everything is built unsigned, loudly.
 USAGE
 }
 
@@ -115,6 +123,8 @@ KERNEL_FLAVOUR="generic"
 KERNEL_ARCH="amd64"
 STAGE1_TIMEOUT=5
 STAGE1_CMDLINE_EXTRA=""
+SB_KEY_DIR=""
+SB_KEY_URI=""
 # shellcheck source=/dev/null
 source "$CONF"
 BOOT_PARTITION="${BOOT_PARTITION:-/boot}"
@@ -370,6 +380,88 @@ tree_dracut_hash() {
         "$1"/usr/lib/dracut/modules.d/90freshroot/* 2>/dev/null | sha256sum | cut -d' ' -f1
 }
 
+# ── Secure Boot signing ──────────────────────────────────────────────
+# The owner's db key, enrolled in firmware (PK/KEK/db enrollment is the
+# owner's process — freshroot never writes firmware variables). Off-tree by
+# default: the state dir at the btrfs top level is never inside a snapshot.
+SB_DIR="${SB_KEY_DIR:-${TOPLEVEL}/freshroot-state/sb}"
+SB_WARNED=0
+
+sb_available() {
+    [[ -r "${SB_DIR}/db.crt" ]] || return 1
+    [[ -n "$SB_KEY_URI" || -r "${SB_DIR}/db.key" ]] || return 1
+    command -v sbsign >/dev/null 2>&1 && command -v sbverify >/dev/null 2>&1
+}
+
+sb_warn_unsigned() {
+    [[ $SB_WARNED -eq 1 ]] && return 0
+    SB_WARNED=1
+    warn "UNSIGNED: no Secure Boot key at ${SB_DIR} (db.key + db.crt) — kernels and UKIs are built unsigned and will not boot with Secure Boot enabled"
+}
+
+# sha256 fingerprint of the signing certificate ('' when unavailable)
+sb_cert_fingerprint() {
+    [[ -r "${SB_DIR}/db.crt" ]] || return 0
+    openssl x509 -in "${SB_DIR}/db.crt" -noout -fingerprint -sha256 2>/dev/null \
+        | cut -d= -f2 | tr -d ':' | tr '[:upper:]' '[:lower:]'
+}
+
+# True when the PE at $1 is signed by our certificate.
+sb_signed_by_us() {
+    sbverify --cert "${SB_DIR}/db.crt" "$1" >/dev/null 2>&1
+}
+
+# True when the PE at $1 carries any Authenticode signature (sbverify
+# --list exits 0 either way; it prints "No signature table present" when
+# there is none).
+pe_is_signed() {
+    local out
+    out=$(sbverify --list "$1" 2>&1) || return 1
+    grep -q '^signature [0-9]' <<<"$out"
+}
+
+# Sign the PE at $1 in place with our key (replacing any existing
+# signature — apt-era kernels are Canonical-signed, which db does not
+# trust). Returns 1 on failure.
+sb_sign_inplace() {
+    local f="$1" tmp="$1.signing"
+    cp -f "$f" "$tmp"
+    sbattach --remove "$tmp" >/dev/null 2>&1 || true
+    if [[ -n "$SB_KEY_URI" ]]; then
+        sbsign --engine pkcs11 --key "$SB_KEY_URI" --cert "${SB_DIR}/db.crt" --output "$f.signed" "$tmp" >/dev/null 2>&1 \
+            || { rm -f "$tmp" "$f.signed"; return 1; }
+    else
+        sbsign --key "${SB_DIR}/db.key" --cert "${SB_DIR}/db.crt" --output "$f.signed" "$tmp" >/dev/null 2>&1 \
+            || { rm -f "$tmp" "$f.signed"; return 1; }
+    fi
+    rm -f "$tmp"
+    sb_signed_by_us "$f.signed" || { rm -f "$f.signed"; return 1; }
+    mv -f "$f.signed" "$f"
+}
+
+# Make sure the store's kernel image for $1 carries our signature (no-op
+# without a key, apart from the warning).
+ensure_signed_kernel() {
+    local f="${DIST}/vmlinuz-$1"
+    if ! sb_available; then sb_warn_unsigned; return 0; fi
+    sb_signed_by_us "$f" && return 0
+    info "signing vmlinuz-$1 with ${SB_DIR}/db.crt"
+    sb_sign_inplace "$f" || die "sbsign failed for vmlinuz-$1"
+}
+
+# Sign a freshly built UKI at $1 when a key is present; echoes yes/no.
+sign_uki_file() {
+    if ! sb_available; then sb_warn_unsigned; echo no; return 0; fi
+    sb_sign_inplace "$1" || die "sbsign failed for ${1##*/}"
+    echo yes
+}
+
+secure_boot_enabled() {
+    local v="/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c"
+    [[ -r "$v" ]] || return 1
+    [[ "$(od -An -tu1 -j4 -N1 "$v" 2>/dev/null | tr -d ' ')" == "1" ]]
+}
+
 have_modules() { [[ -f "${MODULES_PATH}/$1/modules.order" || -d "${MODULES_PATH}/$1/kernel" ]]; }
 have_uki() { [[ -s "${UKIDIR}/uki-$1.efi" ]]; }
 
@@ -418,6 +510,9 @@ build_uki() {
         || die "${snapname} lacks systemd-ukify — run freshroot-update once so a snapshot carries the current freshroot deb and its dependencies"
     [[ -x "${KSTAGE}/usr/bin/dracut" ]] || die "${snapname} lacks dracut"
 
+    # The inner kernel must carry the signature: stage 1 extracts it and
+    # kexec_file_load verifies THAT image, not the outer UKI.
+    ensure_signed_kernel "$kver"
     WORK=$(mktemp -d /var/tmp/freshroot-kernel.XXXXXX)
     cp "${DIST}/vmlinuz-${kver}" "${WORK}/vmlinuz"
     local binds=("--bind=${MODULES_PATH}:/usr/lib/modules" "--bind=${WORK}:/run/freshroot-kernel-work")
@@ -466,9 +561,11 @@ INNER
         "DRACUT_CONF_HASH=${hash}" \
         "FRESHROOT_PKG_VERSION=${pkgver}" \
         "BUILD_TS=$(date -u +%Y%m%dT%H%M%S)" \
+        "SIGNED=${signed}" \
+        "SIGNER_SHA256=$(sb_cert_fingerprint)" \
         "STAGE1=$(meta_get "$kver" STAGE1)"
     rm -rf "${WORK:?}"; WORK=""
-    info "UKI ready: ${UKIDIR#"$TOPLEVEL"/}/uki-${kver}.efi"
+    info "UKI ready: ${UKIDIR#"$TOPLEVEL"/}/uki-${kver}.efi (signed: ${signed})"
 }
 
 # Stale when the UKI or its metadata is missing, the newest snapshot has
@@ -481,6 +578,10 @@ is_stale() {
     [[ -n "$snap" ]] || return 1
     [[ "$(meta_get "$kver" BUILT_FROM_SNAPSHOT)" == "${snap##*/}" ]] || return 0
     [[ "$(meta_get "$kver" DRACUT_CONF_HASH)" == "$(tree_dracut_hash "$snap")" ]] || return 0
+    if sb_available; then
+        [[ "$(meta_get "$kver" SIGNED)" == "yes" ]] || return 0
+        [[ "$(meta_get "$kver" SIGNER_SHA256)" == "$(sb_cert_fingerprint)" ]] || return 0
+    fi
     return 1
 }
 
@@ -792,6 +893,7 @@ build_stage1() {
         cp -a "$mod_src" "${KSTAGE}/usr/lib/dracut/modules.d/"
     fi
 
+    ensure_signed_kernel "$kver"
     WORK=$(mktemp -d /var/tmp/freshroot-kernel.XXXXXX)
     cp "${DIST}/vmlinuz-${kver}" "${WORK}/vmlinuz"
     local include_args=""
@@ -836,11 +938,12 @@ ukify build \
     --output /run/freshroot-kernel-work/stage1.efi
 INNER
     [[ $rc -eq 0 && -s "${WORK}/stage1.efi" ]] || die "stage-1 build failed (exit ${rc})"
+    local signed; signed=$(sign_uki_file "${WORK}/stage1.efi")
     kstage_delete
     mkdir -p "$STAGE1_DIR"
     cp "${WORK}/stage1.efi" "${STAGE1_DIR}/.${STAGE1_NAME}.tmp"
     mv -f "${STAGE1_DIR}/.${STAGE1_NAME}.tmp" "${STAGE1_DIR}/${STAGE1_NAME}"
-    printf 'KVER=%s\nBUILD_TS=%s\nCMDLINE=%s\n' "$kver" "$(date -u +%Y%m%dT%H%M%S)" "$cmdline" \
+    printf 'KVER=%s\nBUILD_TS=%s\nSIGNED=%s\nCMDLINE=%s\n' "$kver" "$(date -u +%Y%m%dT%H%M%S)" "$signed" "$cmdline" \
         > "${STAGE1_DIR}/${STAGE1_NAME}.meta"
     local k
     for k in $(store_kvers); do
@@ -848,7 +951,7 @@ INNER
         if [[ "$k" == "$kver" ]]; then meta_set "$k" STAGE1 yes; else meta_set "$k" STAGE1 no; fi
     done
     rm -rf "${WORK:?}"; WORK=""
-    info "stage-1 UKI ready: ${STAGE1_DIR#"$TOPLEVEL"/}/${STAGE1_NAME} (kernel ${kver})"
+    info "stage-1 UKI ready: ${STAGE1_DIR#"$TOPLEVEL"/}/${STAGE1_NAME} (kernel ${kver}, signed: ${signed})"
 }
 
 # ESP partition device -> disk and partition number for efibootmgr -d/-p.
@@ -866,6 +969,10 @@ install_stage1() {
     local esp="${OPT_ESP:-$EFI_PARTITION}" dst
     mountpoint -q "$esp" || die "ESP not mounted at ${esp} (pass --esp <dir>)"
     [[ -s "${STAGE1_DIR}/${STAGE1_NAME}" ]] || die "no stage-1 UKI built yet"
+    # An unsigned stage 1 under Secure Boot would brick the next boot.
+    if secure_boot_enabled && ! pe_is_signed "${STAGE1_DIR}/${STAGE1_NAME}"; then
+        die "Secure Boot is enabled but the stage-1 UKI is unsigned — put db.key/db.crt in ${SB_DIR} and rebuild"
+    fi
     dst="${esp}/EFI/freshroot"
     mkdir -p "$dst"
     if [[ -f "${dst}/${STAGE1_NAME}" ]]; then
@@ -934,6 +1041,50 @@ cmd_stage1() {
     fi
 }
 
+cmd_sb_status() {
+    local k fp lock
+    if secure_boot_enabled; then echo "Secure Boot: enabled"; else echo "Secure Boot: disabled (or no EFI)"; fi
+    lock=$(cat /sys/kernel/security/lockdown 2>/dev/null || echo unknown)
+    echo "Lockdown:    ${lock}"
+    echo "Key dir:     ${SB_DIR}"
+    if [[ -r "${SB_DIR}/db.crt" ]]; then
+        fp=$(sb_cert_fingerprint)
+        echo "db.crt:      $(openssl x509 -in "${SB_DIR}/db.crt" -noout -subject 2>/dev/null | sed 's/^subject=//')"
+        echo "fingerprint: ${fp}"
+        if [[ -n "$SB_KEY_URI" ]]; then
+            echo "db.key:      token ${SB_KEY_URI}"
+        elif [[ -r "${SB_DIR}/db.key" ]]; then
+            echo "db.key:      present"
+        else
+            echo "db.key:      MISSING — signing disabled"
+        fi
+        if command -v efi-readvar >/dev/null 2>&1 && [[ -d /sys/firmware/efi/efivars ]]; then
+            local subj; subj=$(openssl x509 -in "${SB_DIR}/db.crt" -noout -subject 2>/dev/null | sed 's/^subject=//; s/^ *//')
+            if efi-readvar -v db 2>/dev/null | grep -Fq "$subj"; then
+                echo "firmware db: contains this certificate"
+            else
+                echo "firmware db: does NOT list this certificate (enroll it before enabling Secure Boot)"
+            fi
+        fi
+    else
+        echo "db.crt:      MISSING — signing disabled"
+    fi
+    echo
+    echo "Store:"
+    for k in $(store_kvers); do
+        if have_uki "$k"; then
+            printf '  %-32s UKI signed=%s signer=%s\n' "$k" "$(meta_get "$k" SIGNED)" "$(meta_get "$k" SIGNER_SHA256 | cut -c1-16)"
+        else
+            printf '  %-32s (no UKI)\n' "$k"
+        fi
+    done
+    if [[ -s "${STAGE1_DIR}/${STAGE1_NAME}" ]]; then
+        if pe_is_signed "${STAGE1_DIR}/${STAGE1_NAME}"; then echo "  stage-1: signed"; else echo "  stage-1: UNSIGNED"; fi
+    else
+        echo "  stage-1: not built"
+    fi
+}
+
 case "$SUB" in
     add)      cmd_add ;;
     adopt)    cmd_adopt ;;
@@ -942,6 +1093,6 @@ case "$SUB" in
     rebuild)  cmd_rebuild ;;
     gc)       cmd_gc ;;
     stage1)   cmd_stage1 ;;
-    sb-status) die "'${SUB}' is not available in this build" ;;
+    sb-status) cmd_sb_status ;;
 esac
 info "=== freshroot-kernel ${SUB} completed ==="
