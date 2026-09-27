@@ -10,18 +10,18 @@
 #              run (plain `apt full-upgrade`, not do-release-upgrade, so the
 #              whole upgrade happens inside the disposable @staging clone).
 #   --import   Import a prepared foreign rootfs (directory or tarball) as a
-#              new lineage. The distro must provide a kernel in /boot and an
-#              initramfs implementing the freshroot boot ceremony — see
-#              README "Porting to other distros".
-#   --switch   Persist the default boot lineage (GRUB entry ordering).
+#              new lineage. Kernels come from the shared store; the tree
+#              must implement the freshroot boot ceremony — see README
+#              "Porting to other distros".
+#   --switch   Persist the default boot lineage (stage-1 menu ordering).
 #   --remove   Delete all snapshots of a lineage.
 #
 # NOTE: the helpers resolve_btrfs_device, release_kernel_holds,
-# bootable_kernel_present, the boot-bind helpers, the lineage/prune helpers
-# and die/info/warn are intentionally COPIED from /usr/sbin/freshroot-update
+# uki_store_ok, rebuild_ukis_if_stale, the lineage/prune helpers and
+# die/info/warn are intentionally COPIED from /usr/sbin/freshroot-update
 # (the tools must not share a library per the "edit minimum / new utility
-# alongside" design). If you fix a bug in one, fix it in freshroot-update,
-# freshroot-build and (partial copy) 06_freshroot too.
+# alongside" design). If you fix a bug in one, fix it in freshroot-update
+# and freshroot-build too.
 set -euo pipefail
 
 MODE=""
@@ -70,7 +70,7 @@ Usage: freshroot-install --release <version|codename> [--from REF] [--lineage NA
   --import SRC     Import a prepared rootfs (directory or tar archive) as a
                    new lineage. Requires --lineage. See README
                    "Porting to other distros" for what the tree must provide.
-  --switch NAME    Make lineage NAME the default GRUB boot lineage.
+  --switch NAME    Make lineage NAME the default boot lineage.
   --remove NAME    Delete all snapshots of lineage NAME (refuses the booted
                    and the default lineage).
   --from REF       Source for --release: a lineage name or snapshot name
@@ -104,6 +104,7 @@ if [[ ! -f "$CONF" ]]; then
 fi
 # Defaults for keys the (conffile-preserved) config may predate
 LINEAGE_QUOTAS=()
+MODULES_SUBVOL="@modules"
 # shellcheck source=/dev/null
 source "$CONF"
 BASE_SUBVOL="${BASE_SUBVOL:-@base}"
@@ -117,41 +118,19 @@ TS="$(date -u +%Y%m%dT%H%M%S)"
 # (all manipulate @staging, the top-level mount and update-grub).
 LOCKFILE="/run/freshroot-update.lock"
 LOG_FILE="${LOG_DIR}/install-${TS}.log"
-DEFAULT_LINEAGE_FILE="/boot/freshroot/default-lineage"
+# The sticky default boot lineage lives at the btrfs top level, where the
+# stage-1 menu reads it after unlocking; the legacy /boot copy is kept in
+# sync while that directory exists.
+DEFAULT_LINEAGE_FILE="${TOPLEVEL}/freshroot-state/default-lineage"
+LEGACY_DEFAULT_LINEAGE_FILE="/boot/freshroot/default-lineage"
 
 # ── Helpers ──────────────────────────────────────────────────────────
 die()  { echo "FATAL: $*" | tee -a "$LOG_FILE" >&2; exit 1; }
 info() { echo "[$(date -u +%H:%M:%S)] $*" | tee -a "$LOG_FILE"; }
 warn() { echo "[$(date -u +%H:%M:%S)] WARNING: $*" | tee -a "$LOG_FILE" >&2; }
 
-# Bind / unbind the shared /boot (+EFI) partitions into a subvolume tree so
-# kernel installs inside the container land on the real boot partition.
-mount_boot_binds() {
-    local root="$1"
-    mkdir -p "${root}${BOOT_PARTITION}"
-    mount --bind "$BOOT_PARTITION" "${root}${BOOT_PARTITION}" \
-        || die "failed to bind-mount $BOOT_PARTITION"
-    if [[ -n "$EFI_PARTITION" && "$EFI_PARTITION" != "$BOOT_PARTITION" ]]; then
-        mkdir -p "${root}${EFI_PARTITION}"
-        mount --bind "$EFI_PARTITION" "${root}${EFI_PARTITION}" \
-            || die "failed to bind-mount $EFI_PARTITION"
-    fi
-}
-umount_boot_binds() {
-    local root="$1"
-    if [[ -n "$EFI_PARTITION" && "$EFI_PARTITION" != "$BOOT_PARTITION" ]]; then
-        if mountpoint -q "${root}${EFI_PARTITION}" 2>/dev/null; then
-            umount -R "${root}${EFI_PARTITION}" 2>/dev/null || true
-        fi
-    fi
-    if mountpoint -q "${root}${BOOT_PARTITION}" 2>/dev/null; then
-        umount -R "${root}${BOOT_PARTITION}" 2>/dev/null || true
-    fi
-}
-
 cleanup() {
     local rc=$?
-    umount_boot_binds "${TOPLEVEL}/${STAGING_SUBVOL}"
     if [[ $rc -ne 0 ]] && btrfs subvolume show "${TOPLEVEL}/${STAGING_SUBVOL}" &>/dev/null; then
         # Move the retained staging out of the shared @staging name so the
         # 4-hourly freshroot-update timer neither deletes the evidence nor
@@ -308,14 +287,27 @@ current_lineage() {
     fi
 }
 
-# Record the default boot lineage on first lineage-aware run so GRUB ordering
-# is sticky (changed only by freshroot-install --switch).
+# Record the default boot lineage on first lineage-aware run so menu
+# ordering is sticky (changed only by freshroot-install --switch). A
+# GRUB-era record under /boot is migrated into the top-level state dir.
 ensure_default_lineage() {
     local lin="$1"
     [[ -n "$lin" && "$lin" != "unknown" ]] || return 0
+    if [[ ! -s "$DEFAULT_LINEAGE_FILE" && -s "$LEGACY_DEFAULT_LINEAGE_FILE" ]]; then
+        mkdir -p "$(dirname "$DEFAULT_LINEAGE_FILE")" 2>/dev/null || return 0
+        cp "$LEGACY_DEFAULT_LINEAGE_FILE" "$DEFAULT_LINEAGE_FILE" 2>/dev/null || true
+    fi
     [[ -s "$DEFAULT_LINEAGE_FILE" ]] && return 0
     mkdir -p "$(dirname "$DEFAULT_LINEAGE_FILE")" 2>/dev/null || return 0
     echo "$lin" > "$DEFAULT_LINEAGE_FILE" 2>/dev/null || true
+    write_legacy_default_lineage
+}
+
+# Keep the legacy /boot copy in sync while that directory exists, so a
+# GRUB fallback boot during migration agrees with stage 1.
+write_legacy_default_lineage() {
+    [[ -d "$(dirname "$LEGACY_DEFAULT_LINEAGE_FILE")" ]] || return 0
+    cp "$DEFAULT_LINEAGE_FILE" "$LEGACY_DEFAULT_LINEAGE_FILE" 2>/dev/null || true
 }
 
 # ── Prune old snapshots (per-lineage quotas) ─────────────────────────
@@ -358,10 +350,10 @@ prune_snapshots() {
 }
 
 # ── Suppress update-grub inside the staging tree ─────────────────────
-# Kernel postinsts inside the container would otherwise write the host's
-# grub.cfg (via the bind-mounted /boot) generated without access to
-# @snapshots. Divert it to /bin/true for the container run; the host runs
-# the authoritative update-grub after commit.
+# Trees migrated from the GRUB era still carry grub2-common, whose
+# package hooks call update-grub against the tree's empty /boot. Divert it
+# to /bin/true for the container run; freshroot no longer runs
+# update-grub anywhere (stage 1 reads the snapshot catalog live).
 suppress_staging_update_grub() {
     local root="$1"
     # dpkg-divert (not a plain overwrite) so an apt upgrade of grub2-common
@@ -455,33 +447,38 @@ resolve_from_ref() {
     latest_in_lineage "$ref"
 }
 
-# ── Verify a bootable kernel pair exists for the shared modules ──────
-# Kernel modules live on a dedicated persistent subvolume mounted at
-# /usr/lib/modules and shared by every snapshot; GRUB (06_freshroot) pairs
-# snapshots with the kernels found there whose vmlinuz + initrd exist in
-# /boot. Committing while no such pair exists would produce a snapshot GRUB
-# never offers — the clean entry silently falls back to an older one.
-# Returns 1 (after logging each kernel's state) when nothing is bootable.
+# ── Verify the kernel store can boot the committed tree ──────────────
+# Snapshots carry no kernels: stage 1 boots any snapshot with any UKI from
+# the store on the modules subvolume, so the only way to commit an
+# unbootable system is an empty store. Returns 1 after logging.
 # SYNC: copied in freshroot-update, freshroot-build and freshroot-install.
-bootable_kernel_present() {
-    local mod_dir kver ok=0 states=() s
-    for mod_dir in /usr/lib/modules/*/; do
-        [[ -d "$mod_dir" ]] || continue
-        kver=$(basename "$mod_dir")
-        if [[ ! -e "${BOOT_PARTITION}/vmlinuz-${kver}" ]]; then
-            states+=("${kver}: no ${BOOT_PARTITION}/vmlinuz-${kver}")
-        elif [[ ! -e "${BOOT_PARTITION}/initrd.img-${kver}" && \
-                ! -e "${BOOT_PARTITION}/initramfs-${kver}.img" ]]; then
-            states+=("${kver}: no initrd in ${BOOT_PARTITION}")
-        else
+uki_store_ok() {
+    local ukidir="${TOPLEVEL}/${MODULES_SUBVOL}/.freshroot/uki" f k ok=0
+    for f in "${ukidir}"/uki-*.efi; do
+        [[ -s "$f" ]] || continue
+        k="${f##*/uki-}"; k="${k%.efi}"
+        if [[ -d "${TOPLEVEL}/${MODULES_SUBVOL}/${k}" ]]; then
             ok=1
+        else
+            warn "  ${k}: UKI without a module tree on ${MODULES_SUBVOL}"
         fi
     done
     [[ $ok -eq 1 ]] && return 0
-    warn "no kernel in /usr/lib/modules has a vmlinuz + initrd pair in ${BOOT_PARTITION}"
-    for s in "${states[@]}"; do warn "  ${s}"; done
-    [[ ${#states[@]} -gt 0 ]] || warn "  (no kernel modules in /usr/lib/modules at all)"
+    warn "kernel store ${MODULES_SUBVOL}/.freshroot/uki holds no UKI with a matching module tree"
     return 1
+}
+# ── Refresh UKIs after a commit ──────────────────────────────────────
+# The initramfs userspace comes from the newest snapshot; after a commit
+# the store's UKIs are rebuilt when that changed anything dracut cares
+# about. Our flock (fd 9) is inherited — tell freshroot-kernel not to take
+# it again.
+# SYNC: copied in freshroot-update, freshroot-build and freshroot-install.
+rebuild_ukis_if_stale() {
+    command -v freshroot-kernel >/dev/null 2>&1 \
+        || { warn "freshroot-kernel not installed — UKIs not refreshed"; return 0; }
+    info "refreshing kernel UKIs against the newest snapshot"
+    _FRESHROOT_LOCK_HELD=1 freshroot-kernel rebuild --if-stale 2>&1 | tee -a "$LOG_FILE" \
+        || warn "UKI rebuild failed — snapshots still boot with the existing UKIs"
 }
 
 # ── APT source rewriting for --release ───────────────────────────────
@@ -644,11 +641,6 @@ STAGING_PATH="${TOPLEVEL}/${STAGING_SUBVOL}"
 [[ -d "$SNAP_PATH" ]] || die "snapshots directory not found at ${SNAP_PATH}"
 
 # ── Shared mode plumbing ─────────────────────────────────────────────
-run_update_grub() {
-    info "regenerating GRUB configuration"
-    update-grub 2>&1 | tee -a "$LOG_FILE" || warn "update-grub failed"
-}
-
 # Refuse to write into a lineage that already has snapshots (unless --merge).
 require_lineage_empty() {
     local lin="$1"
@@ -685,7 +677,7 @@ finish_new_lineage() {
     ensure_default_lineage "$(current_lineage)"
     prune_snapshots
 
-    run_update_grub
+    rebuild_ukis_if_stale
 
     info "=== freshroot-install completed successfully ==="
     info "New snapshot in lineage '${new_lineage}': ${new_name}"
@@ -701,8 +693,8 @@ finish_new_lineage() {
     fi
     info "Retention: lineage '${new_lineage}' keeps $(lineage_quota "$new_lineage") snapshot(s)."
     info "  Add \"${new_lineage}=N\" to LINEAGE_QUOTAS in ${CONF} to change it."
-    info "The default boot lineage is unchanged ($(cat "$DEFAULT_LINEAGE_FILE" 2>/dev/null || echo unset))."
-    info "  Try '${new_lineage}' from the GRUB menu first, then make it the default:"
+    info "The default boot lineage is unchanged ($(cat "$DEFAULT_LINEAGE_FILE" 2>/dev/null || cat "$LEGACY_DEFAULT_LINEAGE_FILE" 2>/dev/null || echo unset))."
+    info "  Try '${new_lineage}' from the boot menu first, then make it the default:"
     info "  freshroot-install --switch ${new_lineage}"
 }
 
@@ -715,8 +707,8 @@ do_switch() {
         || die "lineage '${lin}' has no snapshots — nothing to switch to"
     mkdir -p "$(dirname "$DEFAULT_LINEAGE_FILE")"
     echo "$lin" > "$DEFAULT_LINEAGE_FILE"
-    info "default boot lineage set to '${lin}'"
-    run_update_grub
+    write_legacy_default_lineage
+    info "default boot lineage set to '${lin}' (stage 1 reads it at every boot)"
     info "=== freshroot-install --switch completed ==="
     info "Reboot to start '${lin}'."
 }
@@ -730,7 +722,7 @@ do_remove() {
     booted_lin=$(current_lineage)
     [[ "$lin" != "$booted_lin" ]] \
         || die "lineage '${lin}' is the currently booted lineage — boot another lineage first"
-    default_lin=$(cat "$DEFAULT_LINEAGE_FILE" 2>/dev/null || true)
+    default_lin=$(cat "$DEFAULT_LINEAGE_FILE" 2>/dev/null || cat "$LEGACY_DEFAULT_LINEAGE_FILE" 2>/dev/null || true)
     [[ "$lin" != "$default_lin" ]] \
         || die "lineage '${lin}' is the default boot lineage — run 'freshroot-install --switch <other>' first"
 
@@ -749,12 +741,10 @@ do_remove() {
     done
     [[ $failed -eq 0 ]] || die "some snapshots could not be deleted"
 
-    run_update_grub
     info "=== freshroot-install --remove completed ==="
-    info "Lineage '${lin}' removed. Leftovers to clean up manually:"
+    info "Lineage '${lin}' removed (kernels are lineage-independent — nothing to clean up in the store)."
+    info "Leftover to clean up manually:"
     info "  - any \"${lin}=N\" entry in LINEAGE_QUOTAS (${CONF})"
-    info "  - its kernels in /boot, which apt autoremove collects on the next"
-    info "    freshroot-update run"
 }
 
 # ═════════════════════════════════════════════════════════════════════
@@ -839,8 +829,6 @@ do_release() {
     info "creating staging subvolume from snapshot"
     btrfs subvolume snapshot "$latest" "$STAGING_PATH" || die "failed to create staging snapshot"
 
-    mount_boot_binds "$STAGING_PATH"
-
     # Persist the apt cache so downloaded .debs survive @staging deletion
     local apt_cache_bind=("--bind=${TOPLEVEL}/@apt-cache:/var/cache/apt")
 
@@ -872,33 +860,19 @@ apt-get full-upgrade -y \
     -o Dpkg::Options::=--force-confold
 apt-get autoremove -y
 
-# ── Repair missing kernel files in /boot ─────────────────────────────
-# GRUB pairs a snapshot only with kernels whose vmlinuz AND initrd exist in
-# the shared /boot. A kernel whose files went missing there (a failed initrd
-# build, manual cleanup, a foreign tool's autoremove) is still "installed"
-# as far as apt is concerned, so nothing would ever put them back — and
-# every later clone of this tree would inherit the gap.
-for mod_dir in /usr/lib/modules/*/; do
-    kver="${mod_dir%/}"; kver="${kver##*/}"
-    # Only kernels a package still owns; leftover module dirs are skipped.
-    pkg=$(dpkg -S "/boot/vmlinuz-${kver}" 2>/dev/null | head -1 | cut -d: -f1) || pkg=""
-    [ -n "$pkg" ] || continue
-    if [ ! -e "/boot/vmlinuz-${kver}" ]; then
-        echo "==> /boot/vmlinuz-${kver} missing — reinstalling ${pkg}"
-        apt-get install -y --reinstall "$pkg" \
-            || echo "WARNING: reinstall of ${pkg} failed" >&2
-    fi
-    if [ ! -e "/boot/initrd.img-${kver}" ] && [ ! -e "/boot/initramfs-${kver}.img" ]; then
-        echo "==> no initrd for ${kver} in /boot — regenerating"
-        if command -v dracut >/dev/null 2>&1; then
-            dracut -f "/boot/initrd.img-${kver}" "${kver}" \
-                || echo "WARNING: dracut failed for ${kver}" >&2
-        elif command -v update-initramfs >/dev/null 2>&1; then
-            update-initramfs -c -k "${kver}" \
-                || echo "WARNING: update-initramfs failed for ${kver}" >&2
-        fi
-    fi
-done
+# ── Kernel packages leave the tree ───────────────────────────────────
+# freshroot-kernel owns kernels (modules subvolume + UKI store); the pin in
+# /etc/apt/preferences.d/freshroot-kernel-pin keeps apt from bringing
+# them back. One-time on migrated trees, a no-op afterwards.
+_kpkgs=$(dpkg-query -W -f '${Package} ${db:Status-Abbrev}\n' \
+    'linux-image-*' 'linux-modules-*' 'linux-headers-*' 'linux-generic*' 'linux-virtual*' 2>/dev/null \
+    | awk '$2 ~ /^[ih]i/ {print $1}' || true)
+if [ -n "$_kpkgs" ]; then
+    echo "==> purging apt kernel packages (kernels are managed by freshroot-kernel):"
+    echo "$_kpkgs" | sed 's/^/    /'
+    # shellcheck disable=SC2086  # intentionally word-split package list
+    apt-get purge -y $_kpkgs || echo "WARNING: kernel package purge failed" >&2
+fi
 
 # Fail before commit if dpkg is left in a half-configured state
 # (dpkg --audit exits non-zero when it finds problems — the || true keeps
@@ -913,7 +887,6 @@ fi
 INNER
 
     restore_staging_update_grub "$STAGING_PATH"
-    umount_boot_binds "$STAGING_PATH"
 
     if [[ $nspawn_rc -ne 0 ]]; then
         die "release upgrade failed (exit $nspawn_rc)"
@@ -931,8 +904,7 @@ INNER
     new_lineage="${LINEAGE_FLAG:-$new_derived}"
     require_lineage_empty "$new_lineage"
 
-    bootable_kernel_present \
-        || die "refusing to commit a tree GRUB could not boot — staging retained at ${STAGING_SUBVOL}; check free space in ${BOOT_PARTITION} and the kernel/dracut output above"
+    uki_store_ok || die "refusing to commit — the kernel store is empty; run 'freshroot-kernel add' or 'freshroot-kernel adopt' first (staging retained at ${STAGING_SUBVOL})"
 
     commit_staging_as "$new_lineage"
     finish_new_lineage "$new_lineage" "$COMMITTED_NAME"
@@ -944,10 +916,11 @@ INNER
 wire_import_tree() {
     local root="$1"
 
-    # Minimal fstab: /, /boot(+EFI), /home, /var/log and swap stay active
-    # (the root line's boot-time @rootfs rewrite is reverted); the remaining
-    # Ubuntu-shaped state-dir mounts are shipped commented out so they are
-    # mapped to this distro's paths deliberately.
+    # Minimal fstab: /, the ESP, the shared modules/firmware subvolumes,
+    # /home, /var/log and swap stay active (the root line's boot-time
+    # @rootfs rewrite is reverted); the remaining Ubuntu-shaped state-dir
+    # mounts are shipped commented out so they are mapped to this distro's
+    # paths deliberately.
     info "generating /etc/fstab (minimal; distro state-dir mounts commented out)"
     local line target
     {
@@ -960,7 +933,7 @@ wire_import_tree() {
             esac
             target=$(awk '{print $2}' <<<"$line")
             case "$target" in
-                /|"$BOOT_PARTITION"|"$EFI_PARTITION"|/home|/var/log|/swap|none)
+                /|"$BOOT_PARTITION"|"$EFI_PARTITION"|/usr/lib/modules|/usr/lib/firmware|/home|/var/log|/swap|none)
                     printf '%s\n' "${line/subvol=${ROOTFS_SUBVOL},/subvol=${ROOT_SUBVOL},}"
                     ;;
                 *)
@@ -970,6 +943,7 @@ wire_import_tree() {
         done < /etc/fstab
     } > "${root}/etc/fstab"
     mkdir -p "${root}${BOOT_PARTITION}" "${root}${EFI_PARTITION}" "${root}/home" \
+             "${root}/usr/lib/modules" "${root}/usr/lib/firmware" \
              "${root}/var/log" "${root}/swap" "${root}/.snapshots" "${root}/tmp"
 
     if [[ -f /etc/crypttab ]]; then
@@ -996,26 +970,18 @@ wire_import_tree() {
     if [[ ! -f "${root}/usr/lib/freshroot/ceremony" && \
           ! -f "${root}/usr/lib/dracut/modules.d/90freshroot/freshroot-setup.sh" ]]; then
         warn "imported tree has NO freshroot boot-ceremony support:"
-        warn "  its GRUB entries will boot WITHOUT rd.freshroot (read-only root, no"
+        warn "  the boot menu will boot it WITHOUT rd.freshroot (read-only root, no"
         warn "  discard-on-reboot) until the ceremony is ported to its initramfs."
         warn "  See README 'Porting to other distros'; once ported, install"
         warn "  /usr/lib/freshroot/ceremony (containing the ceremony version, currently 1)."
     fi
 
-    local have_kernel=0 mod_dir krel
-    for mod_dir in "${root}/usr/lib/modules"/*/; do
-        [[ -d "$mod_dir" ]] || continue
-        krel=$(basename "$mod_dir")
-        if [[ -f "/boot/vmlinuz-${krel}" ]] && \
-           { [[ -f "/boot/initrd.img-${krel}" ]] || [[ -f "/boot/initramfs-${krel}.img" ]]; }; then
-            have_kernel=1
-        fi
-    done
-    if [[ $have_kernel -eq 0 ]]; then
-        warn "no kernel in /boot matches the imported tree's modules — no GRUB"
-        warn "  entry will appear until /boot/vmlinuz-<kver> plus initrd.img-<kver>"
-        warn "  (or initramfs-<kver>.img) exist for a <kver> present in the tree's"
-        warn "  /usr/lib/modules/."
+    # Kernels come from the shared store, so the tree needs none; but the
+    # store's initramfs is built from the NEWEST snapshot's userspace — a
+    # foreign distro boots it only if that initramfs can handle its root.
+    if [[ -d "${root}/usr/lib/modules" && -n "$(ls -A "${root}/usr/lib/modules" 2>/dev/null)" ]]; then
+        warn "imported tree carries its own /usr/lib/modules — they are shadowed by the"
+        warn "  shared ${MODULES_SUBVOL} mount at boot; kernels must be added with freshroot-kernel."
     fi
 }
 
