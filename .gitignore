@@ -10,3 +10,4 @@ debian/debhelper-build-stamp
 debian/*.substvars
 debian/*.log
 target/*
+debian/*.debhelper
