@@ -62,7 +62,8 @@ btrfs subvolume snapshot /target /target/@
 info "Phase 2: Creating persistent subvolumes"
 for sv in @home @snapshots @log @apt-cache @tmp @spool @crash \
           @containers @flatpak @snap @libvirt @AccountsService \
-          @gdm3 @bluetooth @cups @fwupd @netmanager @machine-id @swap; do
+          @gdm3 @bluetooth @cups @fwupd @netmanager @machine-id @swap \
+          @modules @firmware; do
     btrfs subvolume show "/target/$sv" >/dev/null 2>&1 || \
         btrfs subvolume create "/target/$sv"
 done
@@ -99,6 +100,10 @@ migrate_sv @bluetooth   /var/lib/bluetooth
 migrate_sv @cups        /var/lib/cups
 migrate_sv @fwupd       /var/lib/fwupd
 migrate_sv @netmanager  /etc/NetworkManager/system-connections
+# Kernel modules and firmware are shared by every snapshot (kernels are
+# lineage-independent); the trees keep only the empty mountpoints.
+migrate_sv @modules     /usr/lib/modules
+migrate_sv @firmware    /usr/lib/firmware
 
 # Machine-id
 [ -f "$T/etc/machine-id" ] && cp "$T/etc/machine-id" /target/@machine-id/machine-id
@@ -112,13 +117,45 @@ btrfs filesystem mkswapfile --size 4g "/target/@swap/swapfile"
 info "  swapfile created: @swap/swapfile (4G)"
 
 # ══════════════════════════════════════════════════════════════════════
+# Phase 3.5: Hand the installer's kernel to the freshroot-kernel store
+# ══════════════════════════════════════════════════════════════════════
+# The Ubuntu installer put a kernel into the tree via apt. From here on
+# kernels are managed by freshroot-kernel: the image goes into the store
+# on @modules (its modules were just migrated there) and the packages are
+# purged from the tree — the apt pin shipped by the deb keeps them out.
+# SYNC: the store layout (<@modules>/.freshroot/{dist,uki}) mirrors
+# freshroot-kernel; change both together.
+info "Phase 3.5: Handing the installer kernel to the freshroot-kernel store"
+
+STORE="/target/@modules/.freshroot"
+mkdir -p "$STORE/dist" "$STORE/uki" "$STORE/stage1"
+KVER=$(find /target/@modules -mindepth 1 -maxdepth 1 -type d ! -name '.*' -printf '%f\n' | sort -V | tail -1)
+[[ -n "$KVER" ]] || die "no kernel modules found under @modules — the installer left no kernel?"
+VMLINUZ=""
+for cand in "/target/boot/vmlinuz-${KVER}" "$T/boot/vmlinuz-${KVER}"; do
+    [[ -f "$cand" ]] && { VMLINUZ="$cand"; break; }
+done
+[[ -n "$VMLINUZ" ]] || die "no vmlinuz-${KVER} found on the BOOT partition or in the tree"
+install -m 0644 "$VMLINUZ" "$STORE/dist/vmlinuz-${KVER}"
+info "  kernel ${KVER} placed in the store"
+
+curtin in-target --target="$T" -- apt-get purge -y \
+    'linux-image-*' 'linux-modules-*' 'linux-headers-*' 'linux-generic*' 'linux-virtual*' \
+    || info "  WARNING: purging apt kernel packages failed — freshroot-update purges them on its first run"
+
+# ══════════════════════════════════════════════════════════════════════
 # Phase 4: Generate /etc/fstab
 # ══════════════════════════════════════════════════════════════════════
 info "Phase 4: Generating fstab"
 
 BTRFS_UUID=$(blkid -s UUID -o value "$BTRFS_DEV")
+# A separate unencrypted /boot is optional now: stage 1 lives on the ESP
+# and kernels on @modules. Keep mounting it when the layout has one.
 BOOT_DEV=$(lsblk -rno NAME,LABEL | awk '$2 == "BOOT" {print $1}')
-BOOT_UUID=$(blkid -s UUID -o value "/dev/$BOOT_DEV")
+BOOT_UUID=""
+[[ -n "$BOOT_DEV" ]] && BOOT_UUID=$(blkid -s UUID -o value "/dev/$BOOT_DEV")
+BOOT_LINE=""
+[[ -n "$BOOT_UUID" ]] && BOOT_LINE="UUID=${BOOT_UUID}  /boot  ext4  defaults  0  2"
 EFI_DEV=$(lsblk -rno NAME,LABEL | awk '$2 == "EFI" {print $1}')
 EFI_UUID=$(blkid -s UUID -o value "/dev/$EFI_DEV")
 LUKS_PART=$(lsblk -rno NAME,FSTYPE | grep crypto_LUKS | head -1 | awk '{print $1}')
@@ -134,12 +171,16 @@ cat > "$T/etc/fstab" << FSTAB
 # --- EFI System Partition ---
 UUID=${EFI_UUID}  /boot/efi  vfat  umask=0077  0  1
 
-# --- /boot (unencrypted, outside LUKS) ---
-UUID=${BOOT_UUID}  /boot  ext4  defaults  0  2
+# --- legacy /boot (unencrypted, outside LUKS; empty when the layout has none) ---
+${BOOT_LINE}
 
 # --- btrfs subvolumes (inside LUKS) ---
 # Root — THE snapshotted/rolled-back subvolume
 UUID=${BTRFS_UUID}  /                                        btrfs  subvol=@,${BTRFS_OPTS}              0  0
+
+# Kernel modules + firmware — shared by every snapshot (freshroot-kernel)
+UUID=${BTRFS_UUID}  /usr/lib/modules                         btrfs  subvol=@modules,${BTRFS_OPTS}       0  0
+UUID=${BTRFS_UUID}  /usr/lib/firmware                        btrfs  subvol=@firmware,${BTRFS_OPTS}      0  0
 
 # Persistent subvolumes — survive rollbacks
 UUID=${BTRFS_UUID}  /home                                    btrfs  subvol=@home,${BTRFS_OPTS}          0  0
@@ -198,7 +239,8 @@ for item in /target/*; do
     case "$base" in
         @|@home|@snapshots|@log|@apt-cache|@tmp|@spool|@crash|\
         @containers|@flatpak|@snap|@libvirt|@AccountsService|\
-        @gdm3|@bluetooth|@cups|@fwupd|@netmanager|@machine-id|@swap|@base)
+        @gdm3|@bluetooth|@cups|@fwupd|@netmanager|@machine-id|@swap|@base|\
+        @modules|@firmware|freshroot-state)
             continue ;;
         *)
             if mountpoint -q "$item" 2>/dev/null; then
@@ -300,33 +342,141 @@ btrfs subvolume list /target | while read -r line; do
 done
 
 # ══════════════════════════════════════════════════════════════════════
-# Phase 10: dracut + GRUB configuration
+# Phase 10: Kernel UKI, stage-1 boot menu, ESP
 # ══════════════════════════════════════════════════════════════════════
-info "Phase 10: Configuring dracut and GRUB"
+# Builds the store's first UKI and the stage-1 menu UKI in-target (the
+# installer context has no nspawn), installs stage 1 on the ESP and
+# registers its boot entry. SYNC: the dracut/ukify recipe and the .meta
+# fields mirror freshroot-kernel's build_uki/build_stage1; the signing
+# rule (inner kernel first, then the UKI) mirrors its Secure Boot section.
+info "Phase 10: Building the kernel UKI and the stage-1 boot menu"
 
 mount -t btrfs -o subvol=@,noatime "$BTRFS_DEV" /target/@
-mount -L BOOT "$T/boot"
-mount -L EFI  "$T/boot/efi"
+mount -t btrfs -o subvol=@modules,noatime  "$BTRFS_DEV" "$T/usr/lib/modules"
+mount -t btrfs -o subvol=@firmware,noatime "$BTRFS_DEV" "$T/usr/lib/firmware"
+mount -L EFI "$T/boot/efi"
 
-# Seed the sticky default-lineage record read by 06_freshroot, so GRUB
-# entry ordering never changes without an explicit freshroot-install --switch
+# Sticky default-lineage record, read by stage 1 at every boot
+mkdir -p /target/freshroot-state
 if [ -n "$LINEAGE" ]; then
-    mkdir -p "$T/boot/freshroot"
-    echo "$LINEAGE" > "$T/boot/freshroot/default-lineage"
+    echo "$LINEAGE" > /target/freshroot-state/default-lineage
 fi
 
-curtin in-target --target="$T" -- dracut --regenerate-all --force || true
-curtin in-target --target="$T" -- chmod -x "/etc/grub.d/10_linux"
-curtin in-target --target="$T" -- update-grub
-curtin in-target --target="$T" -- grub-install \
-    --target=x86_64-efi --efi-directory=/boot/efi \
-    --bootloader-id=ubuntu --recheck
+# Secure Boot: sign with the owner's db key when autoinstall shipped it to
+# /target/freshroot-state/sb/{db.key,db.crt} (kept there, off-tree, for
+# freshroot-kernel). Keys are copied into the target's /tmp for sbsign and
+# removed again below.
+SB_SRC="/target/freshroot-state/sb"
+SIGNED=no
+if [ -r "$SB_SRC/db.key" ] && [ -r "$SB_SRC/db.crt" ]; then
+    mkdir -p "$T/tmp/sb"
+    install -m 0600 "$SB_SRC/db.key" "$T/tmp/sb/db.key"
+    install -m 0644 "$SB_SRC/db.crt" "$T/tmp/sb/db.crt"
+    SIGNED=yes
+    info "  Secure Boot key found — kernels and UKIs will be signed"
+else
+    info "  no Secure Boot key at ${SB_SRC} — building UNSIGNED (Secure Boot must stay off)"
+fi
+# sign_pe <path inside target>
+sign_pe() {
+    [ "$SIGNED" = "yes" ] || return 0
+    curtin in-target --target="$T" -- sh -c \
+        "sbattach --remove '$1' 2>/dev/null || true; sbsign --key /tmp/sb/db.key --cert /tmp/sb/db.crt --output '$1.signed' '$1' && mv -f '$1.signed' '$1'"
+}
+SIGNER_SHA256=""
+if [ "$SIGNED" = "yes" ]; then
+    SIGNER_SHA256=$(openssl x509 -in "$SB_SRC/db.crt" -noout -fingerprint -sha256 2>/dev/null \
+        | cut -d= -f2 | tr -d ':' | tr '[:upper:]' '[:lower:]')
+fi
+DRACUT_HASH=$(cat "$T"/etc/dracut.conf "$T"/etc/dracut.conf.d/* "$T"/usr/lib/dracut/dracut.conf.d/* \
+    "$T"/usr/lib/dracut/modules.d/90freshroot/* 2>/dev/null | sha256sum | cut -d' ' -f1)
+# shellcheck disable=SC2016  # dpkg-query format string, not a shell expansion
+PKG_VERSION=$(chroot "$T" dpkg-query -W -f '${Version}' freshroot 2>/dev/null || echo unknown)
+
+# --- The store's first UKI (kernel from Phase 3.5) ---
+# The inner kernel must carry the signature: stage 1 extracts it and
+# kexec_file_load verifies that image, not the outer UKI.
+sign_pe "/usr/lib/modules/.freshroot/dist/vmlinuz-${KVER}"
+curtin in-target --target="$T" -- depmod "$KVER"
+curtin in-target --target="$T" -- dracut --force --no-hostonly --no-hostonly-cmdline \
+    --kver "$KVER" /tmp/initrd.img
+curtin in-target --target="$T" -- ukify build \
+    --linux "/usr/lib/modules/.freshroot/dist/vmlinuz-${KVER}" \
+    --initrd /tmp/initrd.img \
+    --uname "$KVER" \
+    --cmdline "ro rd.freshroot=1" \
+    --output "/usr/lib/modules/.freshroot/uki/uki-${KVER}.efi"
+sign_pe "/usr/lib/modules/.freshroot/uki/uki-${KVER}.efi"
+cat > "$STORE/uki/uki-${KVER}.meta" <<META
+KVER=${KVER}
+SOURCE=installer
+MAINLINE_VER=
+SHA256_VMLINUZ=$(sha256sum "$STORE/dist/vmlinuz-${KVER}" | cut -d' ' -f1)
+BUILT_FROM_SNAPSHOT=${BASELINE}
+DRACUT_CONF_HASH=${DRACUT_HASH}
+FRESHROOT_PKG_VERSION=${PKG_VERSION}
+BUILD_TS=$(date -u +%Y%m%dT%H%M%S)
+SIGNED=${SIGNED}
+SIGNER_SHA256=${SIGNER_SHA256}
+STAGE1=yes
+META
+info "  store UKI built: uki-${KVER}.efi (signed: ${SIGNED})"
+
+# --- Stage-1 boot menu UKI ---
+STAGE1_CMDLINE="root=freshroot rd.freshroot.timeout=5 rd.freshroot.modules=@modules"
+curtin in-target --target="$T" -- dracut --force --kver "$KVER" \
+    --no-hostonly --no-hostonly-cmdline \
+    --omit "systemd systemd-initrd dracut-systemd systemd-cryptsetup plymouth resume network network-legacy network-manager ifcfg url-lib nfs iscsi lvm mdraid fips" \
+    --add "freshroot-stage1" \
+    --add-drivers "virtio_blk virtio_pci virtio_scsi sd_mod nvme ahci dm_crypt btrfs vfat ext4" \
+    --compress zstd \
+    /tmp/stage1.img
+curtin in-target --target="$T" -- ukify build \
+    --linux "/usr/lib/modules/.freshroot/dist/vmlinuz-${KVER}" \
+    --initrd /tmp/stage1.img \
+    --uname "$KVER" \
+    --cmdline "$STAGE1_CMDLINE" \
+    --output /usr/lib/modules/.freshroot/stage1/freshroot-stage1.efi
+sign_pe /usr/lib/modules/.freshroot/stage1/freshroot-stage1.efi
+printf 'KVER=%s\nBUILD_TS=%s\nSIGNED=%s\nCMDLINE=%s\n' "$KVER" "$(date -u +%Y%m%dT%H%M%S)" "$SIGNED" "$STAGE1_CMDLINE" \
+    > "$STORE/stage1/freshroot-stage1.efi.meta"
+rm -f "$T/tmp/initrd.img" "$T/tmp/stage1.img"
+rm -rf "$T/tmp/sb"
+
+# --- ESP: stage 1 at its own path plus the removable-media fallback ---
+mkdir -p "$T/boot/efi/EFI/freshroot" "$T/boot/efi/EFI/BOOT"
+cp "$STORE/stage1/freshroot-stage1.efi" "$T/boot/efi/EFI/freshroot/freshroot-stage1.efi"
+cp "$STORE/stage1/freshroot-stage1.efi" "$T/boot/efi/EFI/BOOT/BOOTX64.EFI"
+touch "$T/boot/efi/EFI/freshroot/.owns-fallback"
+sync
+info "  stage-1 UKI installed on the ESP"
+
+# Boot entry: first in BootOrder on a fresh install (nothing else to
+# preserve). Non-UEFI test rigs have no efivars — warn, the fallback path
+# still boots.
+if [ -d /sys/firmware/efi/efivars ] && command -v efibootmgr >/dev/null 2>&1; then
+    ESP_DISK=$(lsblk -no PKNAME "/dev/$EFI_DEV" 2>/dev/null | head -1)
+    ESP_PART=$(lsblk -no PARTN "/dev/$EFI_DEV" 2>/dev/null | head -1)
+    if [ -n "$ESP_DISK" ] && [ -n "$ESP_PART" ]; then
+        if efibootmgr -c -d "/dev/$ESP_DISK" -p "$ESP_PART" -L freshroot \
+                -l '\EFI\freshroot\freshroot-stage1.efi' >/dev/null; then
+            info "  boot entry 'freshroot' registered"
+        else
+            info "  WARNING: efibootmgr failed — firmware will use the fallback path"
+        fi
+    else
+        info "  WARNING: cannot map the ESP to a disk/partition — firmware will use the fallback path"
+    fi
+else
+    info "  no EFI variables — firmware will use the fallback path EFI/BOOT/BOOTX64.EFI"
+fi
 
 # Unmount Phase 10 mounts before Phase 11
-umount "$T/boot/efi"   2>/dev/null || true
-umount "$T/boot"       2>/dev/null || true
-umount /target/@       2>/dev/null || true
-umount /target         2>/dev/null || true
+umount "$T/boot/efi"         2>/dev/null || true
+umount "$T/usr/lib/firmware" 2>/dev/null || true
+umount "$T/usr/lib/modules"  2>/dev/null || true
+umount /target/@             2>/dev/null || true
+umount /target               2>/dev/null || true
 
 # ══════════════════════════════════════════════════════════════════════
 # Phase 11: Mount @log for installer shutdown
