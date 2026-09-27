@@ -1,0 +1,6 @@
+# Kernels are managed by freshroot-kernel on the modules subvolume, never
+# by apt inside a snapshot tree. This pin keeps apt from ever installing a
+# kernel package here; linux-firmware and linux-libc-dev stay apt-managed.
+Package: linux-image* linux-modules* linux-headers* linux-generic* linux-virtual*
+Pin: release *
+Pin-Priority: -1

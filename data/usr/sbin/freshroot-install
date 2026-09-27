@@ -872,6 +872,20 @@ apt-get full-upgrade -y \
     -o Dpkg::Options::=--force-confold
 apt-get autoremove -y
 
+# ── Kernel packages leave the tree ───────────────────────────────────
+# freshroot-kernel owns kernels (modules subvolume + UKI store); the pin in
+# /etc/apt/preferences.d/freshroot-kernel-pin keeps apt from bringing
+# them back. One-time on migrated trees, a no-op afterwards.
+_kpkgs=$(dpkg-query -W -f '${Package} ${db:Status-Abbrev}\n' \
+    'linux-image-*' 'linux-modules-*' 'linux-headers-*' 'linux-generic*' 'linux-virtual*' 2>/dev/null \
+    | awk '$2 ~ /^[ih]i/ {print $1}' || true)
+if [ -n "$_kpkgs" ]; then
+    echo "==> purging apt kernel packages (kernels are managed by freshroot-kernel):"
+    echo "$_kpkgs" | sed 's/^/    /'
+    # shellcheck disable=SC2086  # intentionally word-split package list
+    apt-get purge -y $_kpkgs || echo "WARNING: kernel package purge failed" >&2
+fi
+
 # ── Repair missing kernel files in /boot ─────────────────────────────
 # GRUB pairs a snapshot only with kernels whose vmlinuz AND initrd exist in
 # the shared /boot. A kernel whose files went missing there (a failed initrd
