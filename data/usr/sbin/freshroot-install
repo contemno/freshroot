@@ -118,7 +118,11 @@ TS="$(date -u +%Y%m%dT%H%M%S)"
 # (all manipulate @staging, the top-level mount and update-grub).
 LOCKFILE="/run/freshroot-update.lock"
 LOG_FILE="${LOG_DIR}/install-${TS}.log"
-DEFAULT_LINEAGE_FILE="/boot/freshroot/default-lineage"
+# The sticky default boot lineage lives at the btrfs top level, where the
+# stage-1 menu reads it after unlocking; the legacy /boot copy is kept in
+# sync while that directory exists.
+DEFAULT_LINEAGE_FILE="${TOPLEVEL}/freshroot-state/default-lineage"
+LEGACY_DEFAULT_LINEAGE_FILE="/boot/freshroot/default-lineage"
 
 # ── Helpers ──────────────────────────────────────────────────────────
 die()  { echo "FATAL: $*" | tee -a "$LOG_FILE" >&2; exit 1; }
@@ -283,14 +287,27 @@ current_lineage() {
     fi
 }
 
-# Record the default boot lineage on first lineage-aware run so GRUB ordering
-# is sticky (changed only by freshroot-install --switch).
+# Record the default boot lineage on first lineage-aware run so menu
+# ordering is sticky (changed only by freshroot-install --switch). A
+# GRUB-era record under /boot is migrated into the top-level state dir.
 ensure_default_lineage() {
     local lin="$1"
     [[ -n "$lin" && "$lin" != "unknown" ]] || return 0
+    if [[ ! -s "$DEFAULT_LINEAGE_FILE" && -s "$LEGACY_DEFAULT_LINEAGE_FILE" ]]; then
+        mkdir -p "$(dirname "$DEFAULT_LINEAGE_FILE")" 2>/dev/null || return 0
+        cp "$LEGACY_DEFAULT_LINEAGE_FILE" "$DEFAULT_LINEAGE_FILE" 2>/dev/null || true
+    fi
     [[ -s "$DEFAULT_LINEAGE_FILE" ]] && return 0
     mkdir -p "$(dirname "$DEFAULT_LINEAGE_FILE")" 2>/dev/null || return 0
     echo "$lin" > "$DEFAULT_LINEAGE_FILE" 2>/dev/null || true
+    write_legacy_default_lineage
+}
+
+# Keep the legacy /boot copy in sync while that directory exists, so a
+# GRUB fallback boot during migration agrees with stage 1.
+write_legacy_default_lineage() {
+    [[ -d "$(dirname "$LEGACY_DEFAULT_LINEAGE_FILE")" ]] || return 0
+    cp "$DEFAULT_LINEAGE_FILE" "$LEGACY_DEFAULT_LINEAGE_FILE" 2>/dev/null || true
 }
 
 # ── Prune old snapshots (per-lineage quotas) ─────────────────────────
@@ -676,7 +693,7 @@ finish_new_lineage() {
     fi
     info "Retention: lineage '${new_lineage}' keeps $(lineage_quota "$new_lineage") snapshot(s)."
     info "  Add \"${new_lineage}=N\" to LINEAGE_QUOTAS in ${CONF} to change it."
-    info "The default boot lineage is unchanged ($(cat "$DEFAULT_LINEAGE_FILE" 2>/dev/null || echo unset))."
+    info "The default boot lineage is unchanged ($(cat "$DEFAULT_LINEAGE_FILE" 2>/dev/null || cat "$LEGACY_DEFAULT_LINEAGE_FILE" 2>/dev/null || echo unset))."
     info "  Try '${new_lineage}' from the boot menu first, then make it the default:"
     info "  freshroot-install --switch ${new_lineage}"
 }
@@ -690,6 +707,7 @@ do_switch() {
         || die "lineage '${lin}' has no snapshots — nothing to switch to"
     mkdir -p "$(dirname "$DEFAULT_LINEAGE_FILE")"
     echo "$lin" > "$DEFAULT_LINEAGE_FILE"
+    write_legacy_default_lineage
     info "default boot lineage set to '${lin}' (stage 1 reads it at every boot)"
     info "=== freshroot-install --switch completed ==="
     info "Reboot to start '${lin}'."
@@ -704,7 +722,7 @@ do_remove() {
     booted_lin=$(current_lineage)
     [[ "$lin" != "$booted_lin" ]] \
         || die "lineage '${lin}' is the currently booted lineage — boot another lineage first"
-    default_lin=$(cat "$DEFAULT_LINEAGE_FILE" 2>/dev/null || true)
+    default_lin=$(cat "$DEFAULT_LINEAGE_FILE" 2>/dev/null || cat "$LEGACY_DEFAULT_LINEAGE_FILE" 2>/dev/null || true)
     [[ "$lin" != "$default_lin" ]] \
         || die "lineage '${lin}' is the default boot lineage — run 'freshroot-install --switch <other>' first"
 
