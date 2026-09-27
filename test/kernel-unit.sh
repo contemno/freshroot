@@ -15,6 +15,9 @@ eval "$(extract mainline_deb_from_index)"
 eval "$(extract checksum_for)"
 eval "$(extract kver_of_extracted)"
 eval "$(extract gc_victims)"
+eval "$(extract efi_entry_id)"
+eval "$(extract efi_boot_order)"
+eval "$(extract efi_order_with)"
 
 KERNEL_FLAVOUR=generic
 KERNEL_ARCH=amd64
@@ -79,5 +82,20 @@ G=$(gc_victims "$LIST" 2 6.8.0-50-generic | tr '\n' ' ')
 check "gc keeps newest 2, never the running kernel" '[ "$G" = "6.8.0-52-generic " ]' "$G"
 G=$(gc_victims "$LIST" 10 x | tr '\n' ' ')
 check "gc removes nothing when under the keep count" '[ -z "$G" ]' "$G"
+
+# ── efibootmgr parsing / BootOrder manipulation ──────────────────────
+EFI_OUT=$'BootCurrent: 0001\nTimeout: 1 seconds\nBootOrder: 0001,0003,0000\nBoot0000* ubuntu\tHD(1,GPT,...)\nBoot0001* Windows Boot Manager\nBoot0003* freshroot\tHD(1,GPT,...)/File(\\EFI\\freshroot\\freshroot-stage1.efi)\nBoot0004* freshroot-old'
+ID=$(efi_entry_id "$EFI_OUT" freshroot)
+check "entry id found by exact label (not the freshroot-old entry)" '[ "$ID" = 0003 ]' "$ID"
+ID=$(efi_entry_id "$EFI_OUT" nothere)
+check "unknown label yields no id" '[ -z "$ID" ]' "$ID"
+O=$(efi_boot_order "$EFI_OUT")
+check "BootOrder parsed" '[ "$O" = "0001,0003,0000" ]' "$O"
+N=$(efi_order_with "0001,0000" 0003 last)
+check "new entry appended last" '[ "$N" = "0001,0000,0003" ]' "$N"
+N=$(efi_order_with "0001,0003,0000" 0003 first)
+check "entry moved to front without duplication" '[ "$N" = "0003,0001,0000" ]' "$N"
+N=$(efi_order_with "" 0003 last)
+check "empty order becomes the entry alone" '[ "$N" = "0003" ]' "$N"
 
 exit $fail

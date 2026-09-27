@@ -45,6 +45,13 @@ Commands:
                                   the newest snapshot or dracut config changed).
   gc                              Keep the newest KERNEL_KEEP kernels (and the
                                   running one), remove the rest.
+  stage1 [--kver <k>] [--install] [--test-next] [--make-default] [--esp <dir>]
+                                  Build the stage-1 boot-menu UKI (newest store
+                                  kernel by default). --install copies it to the
+                                  ESP and registers a "freshroot" boot entry
+                                  WITHOUT changing the boot order; --test-next
+                                  boots it once on the next reboot (BootNext);
+                                  --make-default puts it first in BootOrder.
 
 Options:
   --flavour <name>   Kernel flavour (default: KERNEL_FLAVOUR, "generic")
@@ -52,6 +59,7 @@ Options:
   --require-checksums  Fail when the mirror publishes no checksum for a deb
   --require-gpg      Fail unless CHECKSUMS carries a valid kernel-ppa signature
   --force            Overwrite an existing kernel / remove the running kernel
+  --test-keyfile <f> stage1: embed an unlock keyfile (QEMU rig only)
 USAGE
 }
 
@@ -59,6 +67,7 @@ SUB=""
 OPT_MAINLINE=""; OPT_LATEST=0; OPT_DEBS=(); OPT_VMLINUZ=""; OPT_MODULES=""; OPT_KVER=""
 OPT_ALL=0; OPT_FORCE=0; OPT_IF_STALE=0; OPT_REMOTE=0
 OPT_REQUIRE_CHECKSUMS=0; OPT_REQUIRE_GPG=0; OPT_FLAVOUR=""; OPT_ARCH=""
+OPT_INSTALL=0; OPT_TEST_NEXT=0; OPT_MAKE_DEFAULT=0; OPT_ESP=""; OPT_TEST_KEYFILE=""
 POSITIONAL=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -80,6 +89,11 @@ while [[ $# -gt 0 ]]; do
         --remote)    OPT_REMOTE=1 ;;
         --require-checksums) OPT_REQUIRE_CHECKSUMS=1 ;;
         --require-gpg) OPT_REQUIRE_GPG=1 ;;
+        --install)   OPT_INSTALL=1 ;;
+        --test-next) OPT_TEST_NEXT=1 ;;
+        --make-default) OPT_MAKE_DEFAULT=1 ;;
+        --esp)       [[ $# -ge 2 ]] || { echo "--esp requires a directory" >&2; exit 1; }; OPT_ESP="$2"; shift ;;
+        --test-keyfile) [[ $# -ge 2 ]] || { echo "--test-keyfile requires a file" >&2; exit 1; }; OPT_TEST_KEYFILE="$2"; shift ;;
         -h|--help)   usage; exit 0 ;;
         -*)          echo "freshroot-kernel: unknown option: $1" >&2; exit 1 ;;
         *)           POSITIONAL+=("$1") ;;
@@ -99,6 +113,8 @@ KERNEL_KEEP=3
 MAINLINE_MIRROR="https://kernel.ubuntu.com/mainline"
 KERNEL_FLAVOUR="generic"
 KERNEL_ARCH="amd64"
+STAGE1_TIMEOUT=5
+STAGE1_CMDLINE_EXTRA=""
 # shellcheck source=/dev/null
 source "$CONF"
 BOOT_PARTITION="${BOOT_PARTITION:-/boot}"
@@ -277,6 +293,26 @@ gc_victims() {
     done
 }
 
+# efibootmgr output parsing. $1 = `efibootmgr` output.
+# Entry number (4 hex digits) of the boot entry labelled $2, '' if none.
+efi_entry_id() {
+    printf '%s\n' "$1" | sed -n -E "s/^Boot([0-9A-Fa-f]{4})\*? ${2}\b.*/\1/p" | head -1
+}
+# Current BootOrder as a comma list, '' if none.
+efi_boot_order() {
+    printf '%s\n' "$1" | sed -n -E 's/^BootOrder: *//p' | head -1
+}
+# BootOrder with entry $2 moved to the front (pos=first) or appended
+# (pos=last) of order $1, never duplicated.
+efi_order_with() {
+    local order="$1" id="$2" pos="$3" rest
+    rest=$(printf '%s' "$order" | tr ',' '\n' | grep -vix "$id" | paste -sd, -)
+    case "$pos" in
+        first) printf '%s' "${id}${rest:+,${rest}}" ;;
+        *)     printf '%s' "${rest:+${rest},}${id}" ;;
+    esac
+}
+
 # ── Sanity ───────────────────────────────────────────────────────────
 [[ $(id -u) -eq 0 ]] || die "must be run as root"
 if [[ "${_FRESHROOT_LOCK_HELD:-0}" != "1" ]]; then
@@ -318,6 +354,13 @@ write_meta() {
     local kver="$1"; shift
     printf '%s\n' "$@" > "$(meta_file "$kver").tmp"
     mv -f "$(meta_file "$kver").tmp" "$(meta_file "$kver")"
+}
+
+# meta_set kver KEY VALUE — add or replace one key, keeping the rest
+meta_set() {
+    local f; f=$(meta_file "$1")
+    { [[ -r "$f" ]] && grep -v "^$2=" "$f"; echo "$2=$3"; } > "${f}.tmp"
+    mv -f "${f}.tmp" "$f"
 }
 
 # Inputs to the initramfs that live in the build tree: dracut config plus
@@ -722,6 +765,175 @@ cmd_gc() {
     done
 }
 
+# ── stage 1: the boot-menu UKI on the ESP ────────────────────────────
+STAGE1_DIR="${STORE}/stage1"
+STAGE1_NAME="freshroot-stage1.efi"
+
+# Newest kernel that has both a UKI and modules, '' if none.
+newest_bootable_kver() { bootable_kvers | tail -1; }
+
+build_stage1() {
+    local kver="$1" snap snapname rc=0 mod_src
+    [[ -f "${DIST}/vmlinuz-${kver}" ]] || die "no ${DIST}/vmlinuz-${kver} for stage 1"
+    have_modules "$kver" || die "no module tree for ${kver}"
+    snap=$(newest_snapshot)
+    [[ -n "$snap" ]] || die "no read-only snapshot to build stage 1 from"
+    snapname="${snap##*/}"
+    info "building stage-1 menu UKI on kernel ${kver} in a clone of ${snapname}"
+    kstage_create "$snap"
+    [[ -x "${KSTAGE}/usr/bin/ukify" || -x "${KSTAGE}/usr/lib/systemd/ukify" ]] \
+        || die "${snapname} lacks systemd-ukify — run freshroot-update once so a snapshot carries the current freshroot deb"
+    # The menu module ships in the freshroot deb; a snapshot that predates
+    # it gets the host's copy so migration can bootstrap stage 1.
+    mod_src="/usr/lib/dracut/modules.d/90freshroot-stage1"
+    if [[ ! -f "${KSTAGE}${mod_src}/module-setup.sh" ]]; then
+        [[ -f "${mod_src}/module-setup.sh" ]] || die "90freshroot-stage1 dracut module not found in ${snapname} or on this system"
+        mkdir -p "${KSTAGE}/usr/lib/dracut/modules.d"
+        cp -a "$mod_src" "${KSTAGE}/usr/lib/dracut/modules.d/"
+    fi
+
+    WORK=$(mktemp -d /var/tmp/freshroot-kernel.XXXXXX)
+    cp "${DIST}/vmlinuz-${kver}" "${WORK}/vmlinuz"
+    local include_args=""
+    if [[ -n "$OPT_TEST_KEYFILE" ]]; then
+        [[ -f "$OPT_TEST_KEYFILE" ]] || die "--test-keyfile: no such file: ${OPT_TEST_KEYFILE}"
+        cp "$OPT_TEST_KEYFILE" "${WORK}/test-keyfile"
+        include_args="--include /run/freshroot-kernel-work/test-keyfile /etc/freshroot/test-keyfile"
+    fi
+    local cmdline="root=freshroot rd.freshroot.timeout=${STAGE1_TIMEOUT} rd.freshroot.modules=${MODULES_SUBVOL}"
+    [[ -n "$STAGE1_CMDLINE_EXTRA" ]] && cmdline="${cmdline} ${STAGE1_CMDLINE_EXTRA}"
+    export SYSTEMD_SECCOMP=0
+    # Non-systemd initramfs: stage 1 never hands control to an init — it
+    # ends in kexec -e — and a bash menu owning /dev/console beats fighting
+    # systemd's password agents for it.
+    systemd-nspawn \
+        --directory="$KSTAGE" \
+        --resolv-conf=bind-stub \
+        --setenv=DEBIAN_FRONTEND=noninteractive \
+        --setenv=KVER="$kver" \
+        --setenv=STAGE1_CMDLINE="$cmdline" \
+        --setenv=INCLUDE_ARGS="$include_args" \
+        --bind="${MODULES_PATH}:/usr/lib/modules" \
+        --bind="${WORK}:/run/freshroot-kernel-work" \
+        --quiet \
+        --console=pipe \
+        /bin/bash -e <<'INNER' 2>&1 | tee -a "$LOG_FILE" || rc=${PIPESTATUS[0]}
+depmod "$KVER"
+# shellcheck disable=SC2086  # INCLUDE_ARGS is an intentionally split option list
+dracut --force --kver "$KVER" \
+    --no-hostonly --no-hostonly-cmdline \
+    --omit "systemd systemd-initrd dracut-systemd systemd-cryptsetup plymouth resume network network-legacy network-manager ifcfg url-lib nfs iscsi lvm mdraid fips" \
+    --add "freshroot-stage1" \
+    --add-drivers "virtio_blk virtio_pci virtio_scsi sd_mod nvme ahci dm_crypt btrfs vfat ext4" \
+    --compress zstd \
+    $INCLUDE_ARGS \
+    /run/freshroot-kernel-work/stage1.img
+ukify build \
+    --linux /run/freshroot-kernel-work/vmlinuz \
+    --initrd /run/freshroot-kernel-work/stage1.img \
+    --uname "$KVER" \
+    --cmdline "$STAGE1_CMDLINE" \
+    --output /run/freshroot-kernel-work/stage1.efi
+INNER
+    [[ $rc -eq 0 && -s "${WORK}/stage1.efi" ]] || die "stage-1 build failed (exit ${rc})"
+    kstage_delete
+    mkdir -p "$STAGE1_DIR"
+    cp "${WORK}/stage1.efi" "${STAGE1_DIR}/.${STAGE1_NAME}.tmp"
+    mv -f "${STAGE1_DIR}/.${STAGE1_NAME}.tmp" "${STAGE1_DIR}/${STAGE1_NAME}"
+    printf 'KVER=%s\nBUILD_TS=%s\nCMDLINE=%s\n' "$kver" "$(date -u +%Y%m%dT%H%M%S)" "$cmdline" \
+        > "${STAGE1_DIR}/${STAGE1_NAME}.meta"
+    local k
+    for k in $(store_kvers); do
+        [[ -r "$(meta_file "$k")" ]] || continue
+        if [[ "$k" == "$kver" ]]; then meta_set "$k" STAGE1 yes; else meta_set "$k" STAGE1 no; fi
+    done
+    rm -rf "${WORK:?}"; WORK=""
+    info "stage-1 UKI ready: ${STAGE1_DIR#"$TOPLEVEL"/}/${STAGE1_NAME} (kernel ${kver})"
+}
+
+# ESP partition device -> disk and partition number for efibootmgr -d/-p.
+esp_disk_and_part() {
+    local esp="$1" src disk partn
+    src=$(findmnt -n -o SOURCE "$esp" 2>/dev/null | head -1) || src=""
+    [[ -n "$src" ]] || return 1
+    disk=$(lsblk -no PKNAME "$src" 2>/dev/null | head -1) || disk=""
+    partn=$(lsblk -no PARTN "$src" 2>/dev/null | head -1) || partn=""
+    [[ -n "$disk" && -n "$partn" ]] || return 1
+    printf '/dev/%s %s\n' "$disk" "$partn"
+}
+
+install_stage1() {
+    local esp="${OPT_ESP:-$EFI_PARTITION}" dst
+    mountpoint -q "$esp" || die "ESP not mounted at ${esp} (pass --esp <dir>)"
+    [[ -s "${STAGE1_DIR}/${STAGE1_NAME}" ]] || die "no stage-1 UKI built yet"
+    dst="${esp}/EFI/freshroot"
+    mkdir -p "$dst"
+    if [[ -f "${dst}/${STAGE1_NAME}" ]]; then
+        cp -f "${dst}/${STAGE1_NAME}" "${dst}/freshroot-stage1-prev.efi"
+        info "previous stage-1 kept as EFI/freshroot/freshroot-stage1-prev.efi"
+    fi
+    cp -f "${STAGE1_DIR}/${STAGE1_NAME}" "${dst}/.${STAGE1_NAME}.tmp"
+    mv -f "${dst}/.${STAGE1_NAME}.tmp" "${dst}/${STAGE1_NAME}"
+    sync
+    info "installed ${dst#"$esp"/}/${STAGE1_NAME}"
+    # Removable-media fallback path: claim it only when free or already ours,
+    # so a coexisting bootloader's fallback copy is never overwritten.
+    if [[ ! -f "${esp}/EFI/BOOT/BOOTX64.EFI" || -f "${dst}/.owns-fallback" ]]; then
+        mkdir -p "${esp}/EFI/BOOT"
+        cp -f "${STAGE1_DIR}/${STAGE1_NAME}" "${esp}/EFI/BOOT/.BOOTX64.EFI.tmp"
+        mv -f "${esp}/EFI/BOOT/.BOOTX64.EFI.tmp" "${esp}/EFI/BOOT/BOOTX64.EFI"
+        touch "${dst}/.owns-fallback"
+        info "installed EFI/BOOT/BOOTX64.EFI (removable-media fallback)"
+    fi
+
+    command -v efibootmgr >/dev/null 2>&1 || { warn "efibootmgr not installed — no boot entry registered"; return 0; }
+    [[ -d /sys/firmware/efi/efivars ]] || { warn "no EFI variables (not a UEFI boot?) — no boot entry registered"; return 0; }
+    local out id order dp
+    out=$(efibootmgr 2>/dev/null) || { warn "efibootmgr failed — no boot entry registered"; return 0; }
+    id=$(efi_entry_id "$out" freshroot)
+    order=$(efi_boot_order "$out")
+    if [[ -z "$id" ]]; then
+        dp=$(esp_disk_and_part "$esp") || { warn "cannot map ${esp} to a disk/partition — register the entry by hand: efibootmgr -c -L freshroot -l '\\EFI\\freshroot\\${STAGE1_NAME}'"; return 0; }
+        # -c puts the new entry FIRST; restore the previous order with the
+        # entry appended so nothing changes until --make-default.
+        efibootmgr -c -d "${dp% *}" -p "${dp#* }" -L freshroot -l "\\EFI\\freshroot\\${STAGE1_NAME}" >/dev/null \
+            || { warn "efibootmgr -c failed — register the entry by hand"; return 0; }
+        out=$(efibootmgr 2>/dev/null) || out=""
+        id=$(efi_entry_id "$out" freshroot)
+        [[ -n "$id" ]] || { warn "boot entry not found after creation"; return 0; }
+        if [[ -n "$order" ]]; then
+            efibootmgr -o "$(efi_order_with "$order" "$id" last)" >/dev/null || warn "could not restore BootOrder"
+        fi
+        info "registered boot entry Boot${id} (freshroot), appended to BootOrder"
+    else
+        info "boot entry Boot${id} (freshroot) already registered"
+    fi
+    STAGE1_ENTRY="$id"
+}
+
+cmd_stage1() {
+    local kver="${OPT_KVER:-$(newest_bootable_kver)}"
+    [[ -n "$kver" ]] || die "no bootable kernel in the store — run 'freshroot-kernel add' or 'adopt' first"
+    build_stage1 "$kver"
+    STAGE1_ENTRY=""
+    if [[ $OPT_INSTALL -eq 1 || $OPT_TEST_NEXT -eq 1 || $OPT_MAKE_DEFAULT -eq 1 ]]; then
+        install_stage1
+    fi
+    if [[ $OPT_TEST_NEXT -eq 1 ]]; then
+        [[ -n "$STAGE1_ENTRY" ]] || die "--test-next needs a registered boot entry"
+        efibootmgr -n "$STAGE1_ENTRY" >/dev/null || die "efibootmgr -n failed"
+        info "BootNext set: the next reboot boots stage 1 once (then falls back to the current default)"
+    fi
+    if [[ $OPT_MAKE_DEFAULT -eq 1 ]]; then
+        [[ -n "$STAGE1_ENTRY" ]] || die "--make-default needs a registered boot entry"
+        local out order
+        out=$(efibootmgr 2>/dev/null) || out=""
+        order=$(efi_boot_order "$out")
+        efibootmgr -o "$(efi_order_with "$order" "$STAGE1_ENTRY" first)" >/dev/null || die "efibootmgr -o failed"
+        info "stage 1 is now first in BootOrder"
+    fi
+}
+
 case "$SUB" in
     add)      cmd_add ;;
     adopt)    cmd_adopt ;;
@@ -729,6 +941,7 @@ case "$SUB" in
     remove)   cmd_remove ;;
     rebuild)  cmd_rebuild ;;
     gc)       cmd_gc ;;
-    stage1|sb-status) die "'${SUB}' is not available in this build" ;;
+    stage1)   cmd_stage1 ;;
+    sb-status) die "'${SUB}' is not available in this build" ;;
 esac
 info "=== freshroot-kernel ${SUB} completed ==="
