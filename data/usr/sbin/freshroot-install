@@ -852,6 +852,13 @@ do_release() {
     # syscall-heavy and the filter adds measurable overhead).
     export SYSTEMD_SECCOMP=0
 
+    # Pin nspawn to the unified (v2) cgroup hierarchy. Its "auto" default falls
+    # back to legacy v1 when it cannot find systemd >= 230 in the tree (e.g. a new
+    # lineage before systemd is installed), and the v1 name=systemd hierarchy it
+    # mounts outlives the container until reboot. That leftover hierarchy breaks
+    # rootless podman on the host.
+    export SYSTEMD_NSPAWN_UNIFIED_HIERARCHY=1
+
     local nspawn_rc=0
     suppress_staging_update_grub "$STAGING_PATH"
     info "entering nspawn container for the release upgrade"
@@ -914,6 +921,10 @@ INNER
 
     restore_staging_update_grub "$STAGING_PATH"
     umount_boot_binds "$STAGING_PATH"
+
+    if grep -qs ':name=systemd:' /proc/1/cgroup; then
+        warn "a cgroup v1 name=systemd hierarchy is mounted on the host; rootless podman misbehaves until it is removed (reboot, or mount it and rmdir its empty cgroups)"
+    fi
 
     if [[ $nspawn_rc -ne 0 ]]; then
         die "release upgrade failed (exit $nspawn_rc)"

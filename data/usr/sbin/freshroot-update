@@ -543,6 +543,13 @@ bootable_kernel_present() {
 # acceptable. Set SYSTEMD_LOG_SECCOMP=1 externally to debug.
 export SYSTEMD_SECCOMP=0
 
+# Pin nspawn to the unified (v2) cgroup hierarchy. Its "auto" default falls
+# back to legacy v1 when it cannot find systemd >= 230 in the tree (e.g. a new
+# lineage before systemd is installed), and the v1 name=systemd hierarchy it
+# mounts outlives the container until reboot. That leftover hierarchy breaks
+# rootless podman on the host.
+export SYSTEMD_NSPAWN_UNIFIED_HIERARCHY=1
+
 NSPAWN_RC=0
 suppress_staging_update_grub "$STAGING_PATH"
 
@@ -714,6 +721,10 @@ restore_staging_update_grub "$STAGING_PATH"
 
 # Unmount boot/EFI before snapshotting
 umount -R "${STAGING_PATH}${BOOT_PARTITION}" 2>/dev/null || true
+
+if grep -qs ':name=systemd:' /proc/1/cgroup; then
+    warn "a cgroup v1 name=systemd hierarchy is mounted on the host; rootless podman misbehaves until it is removed (reboot, or mount it and rmdir its empty cgroups)"
+fi
 
 if [[ $NSPAWN_RC -ne 0 ]]; then
     die "nspawn update failed (exit $NSPAWN_RC) — staging retained at ${STAGING_SUBVOL}"
