@@ -117,6 +117,7 @@ This is **not** a general-purpose tool. It targets a specific architecture: LUKS
 
 - **Putting files in `/usr/local/`** — deb policy forbids this, `dh_usrlocal` will error.
 - **Forgetting `--resolv-conf=bind-stub`** on nspawn invocations — DNS will fail.
+- **Dropping the `SYSTEMD_NSPAWN_UNIFIED_HIERARCHY=1` export** next to `SYSTEMD_SECCOMP=0` — nspawn falls back to cgroup v1 for trees without systemd and leaves a `name=systemd` hierarchy on the host that breaks rootless podman until reboot.
 - **Referencing uninitialized variables under `set -u`** — especially in nspawn shells where bash profiles source scripts that assume `SUDO_USER` etc. exist.
 - **Editing subvolume lists in only one place** — they appear in 4 places in the bootstrap script.
 - **Editing lineage helpers in only one file** — they are copied into freshroot-update, freshroot-build, freshroot-install AND 06_freshroot (which runs without `set -u`/`pipefail`).

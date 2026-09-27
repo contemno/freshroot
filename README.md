@@ -100,6 +100,14 @@ For non-Ubuntu distros, `freshroot-install --import <dir|tarball> --lineage <nam
 
 `systemd-nspawn` is launched with `SYSTEMD_SECCOMP=0` exported in its parent env to skip the default syscall filter — apt and git are syscall-heavy enough that the filter overhead is measurable. Staging runs trusted code, so the trade-off is acceptable.
 
+The same env also exports `SYSTEMD_NSPAWN_UNIFIED_HIERARCHY=1`. Without it, nspawn picks legacy cgroup v1 for any tree that lacks systemd 230 or newer (a new lineage before systemd lands in it), and the v1 `name=systemd` hierarchy it mounts stays on the host until reboot. Rootless podman on the host then moves every invocation into a transient scope, which breaks Quadlet `.kube` units on restart. The tools warn after a run if `/proc/1/cgroup` shows that hierarchy. To clear it without rebooting:
+
+```bash
+mount -t cgroup -o none,name=systemd cg1 /mnt
+find /mnt -mindepth 1 -depth -type d -exec rmdir {} +
+umount /mnt
+```
+
 ## Project layout
 
 ```
