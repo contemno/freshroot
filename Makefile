@@ -15,7 +15,6 @@ SCRIPTS  := data/usr/sbin/freshroot-update \
             data/usr/lib/dracut/modules.d/90freshroot-stage1/module-setup.sh \
             data/usr/lib/dracut/modules.d/90freshroot-stage1/freshroot-menu.sh \
             data/usr/lib/dracut/modules.d/90freshroot-stage1/freshroot-menu-lib.sh \
-            data/etc/grub.d/06_freshroot \
             test/pe-unit.sh \
             test/menu-unit.sh \
             test/kernel-unit.sh \
@@ -55,4 +54,4 @@ clean:
 	rm -rf target
 	rm -f debian/debhelper-build-stamp debian/files
 	rm -rf debian/.debhelper debian/$(PACKAGE)
-	rm -f debian/*.substvars debian/*.log
+	rm -f debian/*.substvars debian/*.log debian/*.debhelper

@@ -8,11 +8,15 @@ case "$1" in
         systemctl enable freshroot-provision.service 2>/dev/null || true
         systemctl enable machine-id-persist.service 2>/dev/null || true
 
-        # On upgrades (not first install), regenerate initramfs and GRUB
-        if [ -n "$2" ]; then
-            dracut --regenerate-all --force 2>/dev/null || true
-            update-grub 2>/dev/null || true
+        # Stage 1 replaced GRUB: freshroot no longer writes grub.cfg. Give
+        # the stock kernel entries back to any manual update-grub a migrated
+        # system still runs, so its GRUB fallback stays sane.
+        if [ -f /etc/grub.d/10_linux ]; then
+            chmod +x /etc/grub.d/10_linux 2>/dev/null || true
         fi
+        # Kernel UKIs are refreshed by the freshroot tools after each commit
+        # (freshroot-kernel rebuild --if-stale), not here: this postinst runs
+        # inside the staging container, which must not touch the store.
         ;;
 esac
 
