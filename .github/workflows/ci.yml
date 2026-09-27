@@ -16,13 +16,16 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
-      - name: Install shellcheck
-        run: sudo apt-get install -y shellcheck dpkg-dev
+      - name: Install shellcheck and unit-test tooling
+        run: sudo apt-get install -y shellcheck dpkg-dev systemd-ukify systemd-boot-efi sbsigntool openssl
 
       # make lint keeps the Makefile SCRIPTS variable the single source of
       # truth for which scripts are checked
       - name: Shellcheck scripts
         run: make lint
+
+      - name: Unit tests
+        run: make unit
 
   build:
     runs-on: ubuntu-latest

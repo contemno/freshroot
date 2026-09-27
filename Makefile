@@ -11,9 +11,17 @@ SCRIPTS  := data/usr/sbin/freshroot-update \
             data/usr/lib/dracut/modules.d/90freshroot/module-setup.sh \
             data/usr/lib/dracut/modules.d/90freshroot/freshroot-setup.sh \
             data/usr/lib/dracut/modules.d/90freshroot/freshroot-generator \
-            data/etc/grub.d/06_freshroot
+            data/usr/lib/dracut/modules.d/90freshroot-stage1/module-setup.sh \
+            data/usr/lib/dracut/modules.d/90freshroot-stage1/freshroot-menu.sh \
+            data/usr/lib/dracut/modules.d/90freshroot-stage1/freshroot-menu-lib.sh \
+            data/etc/grub.d/06_freshroot \
+            test/pe-unit.sh \
+            test/menu-unit.sh
+# dracut hooks are sourced by dracut's /bin/sh init — checked in sh dialect
+SH_HOOKS  := data/usr/lib/dracut/modules.d/90freshroot-stage1/parse-freshroot-menu.sh \
+            data/usr/lib/dracut/modules.d/90freshroot-stage1/mount-freshroot-menu.sh
 
-.PHONY: build clean lint
+.PHONY: build clean lint unit
 
 build: $(DEB) $(SETUP)
 
@@ -29,7 +37,14 @@ $(SETUP): installer/freshroot-setup
 	install -m 0755 installer/freshroot-setup $(SETUP)
 
 lint:
-	shellcheck -s bash $(SCRIPTS)
+	shellcheck -s bash -x $(SCRIPTS)
+	shellcheck -s sh $(SH_HOOKS)
+
+# Unit tests that need no root, btrfs or QEMU (ukify/sbsign checks run when
+# the tools are installed and are skipped otherwise)
+unit:
+	bash test/pe-unit.sh
+	bash test/menu-unit.sh
 
 clean:
 	rm -rf target
