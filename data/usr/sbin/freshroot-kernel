@@ -520,6 +520,10 @@ build_uki() {
         binds+=("--bind=${FIRMWARE_PATH}:/usr/lib/firmware")
     fi
     export SYSTEMD_SECCOMP=0
+    # Pin nspawn to the unified (v2) cgroup hierarchy: its "auto" default can
+    # fall back to v1 and leave a name=systemd hierarchy on the host (breaks
+    # rootless podman until reboot). Same pin as freshroot-update.
+    export SYSTEMD_NSPAWN_UNIFIED_HIERARCHY=1
     # --no-hostonly: inside a container dracut would tailor the image to the
     # container's (empty) device view; the initramfs must boot real hardware.
     systemd-nspawn \
@@ -546,6 +550,9 @@ INNER
     pkgver=$(chroot "$KSTAGE" dpkg-query -W -f '${Version}' freshroot 2>/dev/null || echo unknown)
     local hash; hash=$(tree_dracut_hash "$KSTAGE")
     kstage_delete
+    if grep -qs ':name=systemd:' /proc/1/cgroup; then
+        warn "a cgroup v1 name=systemd hierarchy is mounted on the host; rootless podman misbehaves until it is removed (reboot, or mount it and rmdir its empty cgroups)"
+    fi
 
     cp "${WORK}/uki.efi" "${UKIDIR}/.uki-${kver}.efi.tmp"
     mv -f "${UKIDIR}/.uki-${kver}.efi.tmp" "${UKIDIR}/uki-${kver}.efi"
@@ -905,6 +912,10 @@ build_stage1() {
     local cmdline="root=freshroot rd.freshroot.timeout=${STAGE1_TIMEOUT} rd.freshroot.modules=${MODULES_SUBVOL}"
     [[ -n "$STAGE1_CMDLINE_EXTRA" ]] && cmdline="${cmdline} ${STAGE1_CMDLINE_EXTRA}"
     export SYSTEMD_SECCOMP=0
+    # Pin nspawn to the unified (v2) cgroup hierarchy: its "auto" default can
+    # fall back to v1 and leave a name=systemd hierarchy on the host (breaks
+    # rootless podman until reboot). Same pin as freshroot-update.
+    export SYSTEMD_NSPAWN_UNIFIED_HIERARCHY=1
     # Non-systemd initramfs: stage 1 never hands control to an init — it
     # ends in kexec -e — and a bash menu owning /dev/console beats fighting
     # systemd's password agents for it.
@@ -940,6 +951,9 @@ INNER
     [[ $rc -eq 0 && -s "${WORK}/stage1.efi" ]] || die "stage-1 build failed (exit ${rc})"
     local signed; signed=$(sign_uki_file "${WORK}/stage1.efi")
     kstage_delete
+    if grep -qs ':name=systemd:' /proc/1/cgroup; then
+        warn "a cgroup v1 name=systemd hierarchy is mounted on the host; rootless podman misbehaves until it is removed (reboot, or mount it and rmdir its empty cgroups)"
+    fi
     mkdir -p "$STAGE1_DIR"
     cp "${WORK}/stage1.efi" "${STAGE1_DIR}/.${STAGE1_NAME}.tmp"
     mv -f "${STAGE1_DIR}/.${STAGE1_NAME}.tmp" "${STAGE1_DIR}/${STAGE1_NAME}"
