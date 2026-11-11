@@ -7,7 +7,7 @@
 #
 # shellcheck disable=SC2016  # check() expressions are single-quoted for eval
 # shellcheck disable=SC2034  # globals are consumed by the eval'd functions
-# shellcheck disable=SC2317  # the btrfs stub is called via the eval'd code
+# shellcheck disable=SC2317,SC2329  # the btrfs stub is called via the eval'd code
 set -u
 
 HERE="$(cd "$(dirname "$0")" && pwd)"

@@ -7,7 +7,7 @@
 # payload bytes — including the VirtualSize-vs-SizeOfRawData padding rule.
 #
 # shellcheck disable=SC2016  # check() expressions are single-quoted for eval
-# shellcheck disable=SC2317  # extract() is called via the eval'd expressions
+# shellcheck disable=SC2317,SC2329  # extract() is called via the eval'd expressions
 set -u
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
