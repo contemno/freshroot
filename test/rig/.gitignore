@@ -1,0 +1,5 @@
+disk.img
+vars-sb.fd
+serial-*.log
+sb/
+__pycache__/
